@@ -87,6 +87,7 @@ mod linux {
         let mut hid_buf = [0_u8; REPORT_LEN];
         let mut wire_buf = [0_u8; INPUT_PACKET_LEN];
         let mut sequence: u32 = 0;
+        let mut last_state: Option<ControllerState> = None;
         let mut last_print = Instant::now();
         let mut stdout = std::io::stdout();
 
@@ -94,19 +95,21 @@ mod linux {
             if !read_one(&mut file, &mut hid_buf) {
                 continue;
             }
-            let Some(state) = decode_or_skip(&hid_buf, &mut stats) else {
-                continue;
-            };
-            stats.frames += 1;
-
-            if let (Some(s), Some(t)) = (socket.as_ref(), target) {
-                send_packet(s, t, &state, sequence, &mut wire_buf, &mut stats);
-                sequence = sequence.wrapping_add(1);
+            if let Some(state) = decode_or_skip(&hid_buf, &mut stats) {
+                stats.frames += 1;
+                if let (Some(s), Some(t)) = (socket.as_ref(), target) {
+                    send_packet(s, t, &state, sequence, &mut wire_buf, &mut stats);
+                    sequence = sequence.wrapping_add(1);
+                }
+                last_state = Some(state);
             }
 
+            // Always tick the print, even if every frame so far was the
+            // wrong report type — surfaces "skipped" climbing so you can
+            // tell the device is alive but not in gamepad mode.
             if last_print.elapsed() >= PRINT_EVERY {
                 last_print = Instant::now();
-                print_status(&mut stdout, &stats, &state);
+                print_status(&mut stdout, &stats, last_state.as_ref());
             }
         }
     }
@@ -209,35 +212,39 @@ mod linux {
             .unwrap_or(0)
     }
 
-    fn print_status<W: Write>(out: &mut W, stats: &Stats, state: &ControllerState) {
+    fn print_status<W: Write>(out: &mut W, stats: &Stats, state: Option<&ControllerState>) {
         let _ = write!(
             out,
-            "\x1b[2K\rframes={:>7} skipped={:>5} sent={:>7} senderr={:>4} \
-             seq={:>10} \
-             L({:>+6},{:>+6}) R({:>+6},{:>+6}) \
-             LT={:>5} RT={:>5} \
-             accel({:>+6},{:>+6},{:>+6}) \
-             gyro({:>+6},{:>+6},{:>+6}) \
-             btns={:?}",
-            stats.frames,
-            stats.skipped,
-            stats.sent,
-            stats.send_errors,
-            state.sequence,
-            state.left_stick.x,
-            state.left_stick.y,
-            state.right_stick.x,
-            state.right_stick.y,
-            state.left_trigger,
-            state.right_trigger,
-            state.accel.x,
-            state.accel.y,
-            state.accel.z,
-            state.gyro.x,
-            state.gyro.y,
-            state.gyro.z,
-            state.buttons,
+            "\x1b[2K\rframes={:>7} skipped={:>5} sent={:>7} senderr={:>4}",
+            stats.frames, stats.skipped, stats.sent, stats.send_errors,
         );
+        if let Some(state) = state {
+            let _ = write!(
+                out,
+                " seq={:>10} \
+                 L({:>+6},{:>+6}) R({:>+6},{:>+6}) \
+                 LT={:>5} RT={:>5} \
+                 accel({:>+6},{:>+6},{:>+6}) \
+                 gyro({:>+6},{:>+6},{:>+6}) \
+                 btns={:?}",
+                state.sequence,
+                state.left_stick.x,
+                state.left_stick.y,
+                state.right_stick.x,
+                state.right_stick.y,
+                state.left_trigger,
+                state.right_trigger,
+                state.accel.x,
+                state.accel.y,
+                state.accel.z,
+                state.gyro.x,
+                state.gyro.y,
+                state.gyro.z,
+                state.buttons,
+            );
+        } else {
+            let _ = write!(out, " (no Deck-state frames yet)");
+        }
         let _ = out.flush();
     }
 }
