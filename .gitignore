@@ -1,0 +1,20 @@
+# Cargo
+/target/
+
+# IDE / editor
+/.idea/
+/.vscode/
+*.iml
+*.swp
+
+# OS junk
+Thumbs.db
+.DS_Store
+
+# Reference materials — GPL-2.0+ kernel sources, fetched on demand.
+# See tools/README.md.
+/tools/reference/
+
+# Local environment overrides
+.env
+*.local

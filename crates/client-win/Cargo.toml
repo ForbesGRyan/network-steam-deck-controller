@@ -1,0 +1,21 @@
+[package]
+name = "client-win"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+description = "Windows side: receive controller state from Deck, hand HID reports to UDE driver"
+
+[dependencies]
+deck-protocol = { path = "../deck-protocol" }
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.59", features = [
+    "Win32_Foundation",
+    "Win32_Storage_FileSystem",
+    "Win32_System_IO",
+    "Win32_Devices_DeviceAndDriverInstallation",
+    "Win32_Security",
+] }
+
+[lints]
+workspace = true

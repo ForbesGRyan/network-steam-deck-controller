@@ -1,0 +1,176 @@
+# network-usb
+
+Wireless gamepad bridge: Steam Deck controls → Windows PC, presented as a Steam
+Deck controller via a virtual USB device. Steam Input on Windows handles all
+gameplay-side mapping (gyro, trackpads, profiles).
+
+## Goal
+
+Run Rust on the Deck. Run Rust + a small KMDF driver on Windows. Deck
+controller inputs reach Windows games as if a Deck were physically plugged in.
+Wireless, low latency, full-duplex (rumble back to Deck).
+
+## Non-goals
+
+- Generic USB-over-IP. Not building a USB tunnel.
+- Cross-controller emulation (Xbox, DualShock). Out of scope unless Deck
+  emulation hits an unrecoverable wall.
+- Multi-client / multi-Deck. One Deck, one Windows PC.
+- Non-Windows clients.
+
+## Why this design (decision history)
+
+Worked through alternatives in order:
+
+1. **USB/IP + usbip-win2.** Generic, works, but Windows side needs a
+   test-signed kernel driver users must install. UX hostile.
+2. **Userspace via ViGEmBus.** No kernel work on our side, but ViGEmBus is in
+   maintenance/EOL and only exposes Xbox / DS4 shapes — would lose Deck
+   features (gyro, trackpads, back paddles).
+3. **Custom UDE driver, emulate Steam Controller gen 2.** Right shape, but SC2
+   protocol is undocumented; reverse-engineering work + risk of an
+   anti-counterfeit handshake.
+4. **Custom UDE driver, emulate Steam Deck controller.** Selected. Protocol
+   documented in Linux `drivers/hid/hid-steam.c` (GPL) and SDL's
+   `SDL_hidapi_steamdeck.c` (zlib). Steam Input on Windows already recognizes
+   Deck VID/PID. Symmetric: Deck → virtual Deck is identity transform.
+
+## Components
+
+```
++-------------------- Deck (Linux, Rust) --------------------+
+| server-deck                                                |
+|   read internal controller (hidraw or evdev)               |
+|   encode canonical state                                   |
+|   send over UDP (input)                                    |
+|   receive over reliable channel (rumble out)               |
++-----------------------------|------------------------------+
+                              |
+                              | custom protocol over Wi-Fi
+                              | UDP for inputs (high rate, drop OK)
+                              | TCP / rUDP for outputs (rumble — reliable)
+                              v
++------------------- Windows (Rust + C++) -------------------+
+| client-win  (user-mode Rust service)                       |
+|   recv network                                             |
+|   jitter buffer (3-5 ms)                                   |
+|   DeviceIoControl <-> driver                               |
+|                  ^                                         |
+|                  v                                         |
+| driver  (KMDF + UdeCx, C++)                                |
+|   virtual USB device, VID 0x28de PID 0x1205                |
+|   HID descriptor + reports byte-identical to real Deck     |
+|   feature-report path (lizard-mode disable, haptics ack)   |
++-----------------------------|------------------------------+
+                              v
+                Steam Input recognizes Deck controller
+```
+
+## Crates and dirs
+
+- `crates/deck-protocol/` — Rust types for Deck HID reports, canonical
+  controller state, network wire format. No I/O. Shared between Deck server
+  and Windows client.
+- `crates/server-deck/` — binary, runs on Deck. Reads controller, sends state.
+  *(not yet scaffolded)*
+- `crates/client-win/` — binary, runs on Windows. Receives state, talks to
+  driver via DeviceIoControl. *(not yet scaffolded)*
+- `driver/` — KMDF + UdeCx driver, C++. Outside the Cargo workspace.
+  *(not yet scaffolded)*
+
+## Wire protocol (sketch, v0)
+
+Shared 16-byte header (magic, version, channel id, sequence number), then a
+channel-specific body.
+
+- Channel `INPUT`: UDP, Deck → Windows. Body = canonical controller state at
+  ~500 Hz. Receiver drops out-of-order/late packets via sequence number.
+- Channel `OUTPUT`: TCP (or reliable UDP later), Windows → Deck. Body = rumble
+  / LED commands. Reliable.
+
+Pairing: shared-secret handshake. Out of scope for v0; assume trusted LAN.
+
+## Driver
+
+KMDF driver linked against `UdeCx`. Exposes one virtual USB device matching
+real Deck descriptors. User-mode IPC: one IOCTL pair (push input report, pop
+output report).
+
+Signing path:
+
+- **Dev:** test-signing mode (`bcdedit /set testsigning on`).
+- **Distribution:** EV cert + Microsoft Partner Center attestation signing.
+- WHQL not pursued.
+
+## Open risks
+
+- Steam fingerprints something beyond HID descriptor (parent-hub topology,
+  device serial). Mitigation: capture real Deck device tree on Windows,
+  mirror what matters.
+- Wi-Fi jitter spikes blow through the jitter buffer. Mitigation: 5 GHz only,
+  DSCP-tag latency-sensitive packets, fall back to wired Deck dock.
+- Feature-report sequence subtleties (lizard-mode disable, haptics-config
+  ack). Mitigation: read `hid-steam.c` init path carefully, cross-check SDL.
+
+## Build sequence
+
+1. ✅ Lift Deck HID layout into `deck-protocol` (Rust types + codec).
+2. ⏳ Spike: parse a real Deck input report on Linux via hidraw.
+   *Scaffold landed in `crates/server-deck` — **pending hardware validation**,
+   see [Pending validations](#pending-validations).*
+3. ⏳ Static UDE driver: hardcoded descriptors, canned report on a timer. Goal:
+   Steam shows "Steam Deck Controls." *Scaffold landed in `driver/` — files,
+   IOCTL contract, INF, README. Bodies stubbed (`STATUS_NOT_IMPLEMENTED`)
+   pending WDK setup; see `driver/README.md`.*
+4. Feature-report path: lizard-mode disable, haptics-config ack.
+5. User-mode IPC + live HID frames over IOCTL.
+6. Deck server reading hidraw → network → driver.
+7. Output path: rumble back to Deck.
+8. Polish: reconnect, pairing, packaging.
+
+## Pending validations
+
+Things that need real hardware before the next protocol-extending step lands.
+
+### Deck hidraw spike (build sequence step 2)
+
+`crates/server-deck` reads a Deck `/dev/hidraw*` node and decodes input
+reports through `deck-protocol`. The codec was lifted from kernel source
+without ever being run against a live device. **Run this before extending
+the protocol or driver further** — bit-position errors in `BUTTON_MAP`
+won't be caught by the existing round-trip tests.
+
+Procedure (full version in `crates/server-deck/src/main.rs` module docs):
+
+1. Copy workspace to Deck, `cargo build --release -p server-deck`.
+2. Stop Steam (it owns the controller).
+3. Find the controller's hidraw node by grepping
+   `/sys/class/hidraw/*/device/uevent` for `HID_ID=0003:000028DE:00001205`.
+4. Unbind `hid-steam` for that device id.
+5. `sudo ./target/release/server-deck /dev/hidrawN`.
+
+Validation checklist:
+
+| Input | Expected change |
+|---|---|
+| A / B / X / Y | matching `Buttons` flag toggles |
+| L1 / R1 + full L2 / R2 pulls | digital flags + analog `LT` / `RT` rises |
+| Sticks | `L(x,y)` / `R(x,y)` swing through full range, centered ≈ 0 |
+| Trackpads (touch + click) | `*PAD_TOUCH` / `*PAD_CLICK`, `left/right_pad` |
+| Steam / View / Menu / QAM | system flags |
+| L4 / L5 / R4 / R5 paddles | back-paddle flags |
+| Tilt the Deck | `gyro` non-zero, `accel` shifts |
+
+Any unexpected behavior = bit-position bug in `crates/deck-protocol/src/hid.rs::BUTTON_MAP`.
+Capacitive thumbstick touch is **not** covered by the kernel driver — its
+bit position is currently unknown and will need to be discovered from a USB
+capture (USBPcap on Windows or `usbmon` on Linux while a real Deck is
+attached).
+
+## Decisions log
+
+- 2026-05-06 — Picked Deck emulation over SC2 emulation. Documented protocol
+  vs RE work, no auth-handshake risk.
+- 2026-05-06 — Picked UDE over raw KMDF bus driver. Less PnP surface,
+  Microsoft-supported framework for this exact use case.
+- 2026-05-06 — UDP for inputs, reliable channel for outputs.
