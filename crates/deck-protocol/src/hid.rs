@@ -5,7 +5,7 @@
 //! input report; the feature-report `enum` for opcodes.
 //!
 //! Wire shape of every Steam Controller / Deck report (USB interrupt-in,
-//! 64 bytes, little-endian):
+//! little-endian):
 //!
 //! ```text
 //! 0    : 0x01    \  framing prefix; the kernel checks both
@@ -15,7 +15,7 @@
 //! 4..N : payload -> meaning depends on `type`
 //! ```
 //!
-//! For Deck input (`type == 0x09`) the 64-byte buffer holds:
+//! For Deck input (`type == 0x09`) the 60-byte buffer holds:
 //!
 //! ```text
 //! 4..8   u32   sequence number
@@ -54,8 +54,9 @@ pub const PID_STEAM_CONTROLLER: u16 = 0x1102;
 /// Steam Controller wireless dongle PID. Reference only.
 pub const PID_STEAM_CONTROLLER_WIRELESS: u16 = 0x1142;
 
-/// Length of every Steam Controller / Deck report on the wire.
-pub const REPORT_LEN: usize = 64;
+/// Length of a Deck input report on the wire: 4-byte framing header
+/// (`0x01 0x00 type len`) plus the [`DECK_PAYLOAD_LEN`]-byte payload.
+pub const REPORT_LEN: usize = 4 + DECK_PAYLOAD_LEN as usize;
 
 /// Always-on framing prefix at byte 0.
 pub const FRAME_PREFIX_0: u8 = 0x01;
@@ -65,7 +66,7 @@ pub const FRAME_PREFIX_1: u8 = 0x00;
 /// Payload length the Deck reports for its input frames (byte 3).
 pub const DECK_PAYLOAD_LEN: u8 = 56;
 
-/// Report type values (byte 2 of every 64-byte report).
+/// Report type values (byte 2 of every report).
 pub mod report_type {
     /// Steam Controller input data (60-byte payload).
     pub const CONTROLLER_STATE: u8 = 1;
@@ -152,7 +153,7 @@ fn write_le_i16(buf: &mut [u8], off: usize, val: i16) {
     buf[off + 1] = bytes[1];
 }
 
-/// Parse a 64-byte raw Deck HID input report into canonical state.
+/// Parse a [`REPORT_LEN`]-byte raw Deck HID input report into canonical state.
 ///
 /// # Errors
 /// - [`HidError::BadLength`] if `buf.len() != REPORT_LEN`.
@@ -231,7 +232,7 @@ pub fn parse_input_report(buf: &[u8]) -> Result<ControllerState, HidError> {
     })
 }
 
-/// Encode canonical state into a 64-byte Deck HID input report buffer.
+/// Encode canonical state into a [`REPORT_LEN`]-byte Deck HID input report buffer.
 ///
 /// Bytes outside the documented field offsets are zeroed.
 ///
