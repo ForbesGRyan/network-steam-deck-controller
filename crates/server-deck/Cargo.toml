@@ -7,6 +7,7 @@ description = "Steam Deck side: read internal controller via hidraw, send canoni
 
 [dependencies]
 deck-protocol = { path = "../deck-protocol" }
+discovery = { path = "../discovery" }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 libc = "0.2"
