@@ -126,6 +126,60 @@ pub fn fingerprint(pubkey: &[u8; PUBKEY_LEN]) -> [u8; FPR_LEN] {
     out
 }
 
+use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SignError {
+    NameTooLong,
+}
+
+impl From<PacketError> for SignError {
+    fn from(_: PacketError) -> Self { Self::NameTooLong }
+}
+
+/// Encode + sign in one shot. The packet's `pubkey` field must match
+/// `signing.verifying_key().to_bytes()`.
+///
+/// # Errors
+/// Returns `SignError::NameTooLong` if `p.name` exceeds `NAME_MAX` bytes.
+pub fn sign_into(
+    signing: &SigningKey,
+    p: &BeaconPacket,
+    out: &mut [u8; PACKET_LEN],
+) -> Result<(), SignError> {
+    encode_body(p, out)?;
+    let sig: Signature = signing.sign(&out[..SIGNED_LEN]);
+    out[SIGNED_LEN..PACKET_LEN].copy_from_slice(&sig.to_bytes());
+    Ok(())
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum VerifyError {
+    Decode(PacketError),
+    BadPubkey,
+    BadSig,
+}
+
+impl From<PacketError> for VerifyError {
+    fn from(e: PacketError) -> Self { Self::Decode(e) }
+}
+
+/// Parse + verify the trailing Ed25519 signature against the embedded
+/// pubkey. Returns the decoded packet on success.
+///
+/// # Errors
+/// `VerifyError::Decode` for any bytewise parse failure;
+/// `VerifyError::BadPubkey` if the embedded pubkey isn't a valid
+/// Ed25519 point; `VerifyError::BadSig` if the signature doesn't
+/// verify against the signed body.
+pub fn verify(buf: &[u8]) -> Result<BeaconPacket, VerifyError> {
+    let (p, sig_bytes) = decode(buf)?;
+    let vk = VerifyingKey::from_bytes(&p.pubkey).map_err(|_| VerifyError::BadPubkey)?;
+    let sig = Signature::from_bytes(&sig_bytes);
+    vk.verify(&buf[..SIGNED_LEN], &sig).map_err(|_| VerifyError::BadSig)?;
+    Ok(p)
+}
+
 /// Render a fingerprint as `aa:bb:cc:dd:ee:ff:gg:hh`.
 #[must_use]
 pub fn fingerprint_str(fpr: &[u8; FPR_LEN]) -> String {
@@ -206,5 +260,48 @@ mod tests {
         buf[6] = 1;        // name_len = 1
         buf[56] = 0xFF;    // first name byte: not valid UTF-8
         assert!(matches!(decode(&buf), Err(PacketError::BadName)));
+    }
+
+    use ed25519_dalek::SigningKey;
+    use rand_core::OsRng;
+
+    #[test]
+    fn sign_verify_roundtrip() {
+        let signing = SigningKey::generate(&mut OsRng);
+        let pubkey_bytes = signing.verifying_key().to_bytes();
+
+        let mut p = sample();
+        p.pubkey = pubkey_bytes;
+
+        let mut buf = [0_u8; PACKET_LEN];
+        sign_into(&signing, &p, &mut buf).unwrap();
+
+        let (decoded, _sig) = decode(&buf).unwrap();
+        assert_eq!(decoded, p);
+        assert!(verify(&buf).is_ok());
+    }
+
+    #[test]
+    fn flipped_bit_in_body_rejected() {
+        let signing = SigningKey::generate(&mut OsRng);
+        let mut p = sample();
+        p.pubkey = signing.verifying_key().to_bytes();
+
+        let mut buf = [0_u8; PACKET_LEN];
+        sign_into(&signing, &p, &mut buf).unwrap();
+        buf[10] ^= 0x01; // mutate a pubkey byte
+        assert!(verify(&buf).is_err());
+    }
+
+    #[test]
+    fn flipped_bit_in_sig_rejected() {
+        let signing = SigningKey::generate(&mut OsRng);
+        let mut p = sample();
+        p.pubkey = signing.verifying_key().to_bytes();
+
+        let mut buf = [0_u8; PACKET_LEN];
+        sign_into(&signing, &p, &mut buf).unwrap();
+        buf[PACKET_LEN - 1] ^= 0x01;
+        assert!(verify(&buf).is_err());
     }
 }
