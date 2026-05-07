@@ -1,6 +1,7 @@
 //! Beacon packet wire format. Fixed size, signed by the sender.
 
 use sha2::{Digest, Sha256};
+use std::fmt::Write as _;
 
 pub const MAGIC: [u8; 4] = *b"NDB1";
 pub const VERSION: u8 = 1;
@@ -36,15 +37,24 @@ pub enum PacketError {
 }
 
 /// Encode the body (everything except the signature) into `out[..SIGNED_LEN]`.
+///
+/// # Errors
+///
+/// Returns [`PacketError::BadNameLen`] if `p.name` exceeds [`NAME_MAX`] bytes.
 pub fn encode_body(p: &BeaconPacket, out: &mut [u8; PACKET_LEN]) -> Result<(), PacketError> {
     if p.name.len() > NAME_MAX {
-        return Err(PacketError::BadNameLen(p.name.len() as u8));
+        return Err(PacketError::BadNameLen(
+            u8::try_from(p.name.len()).unwrap_or(u8::MAX),
+        ));
     }
     out.fill(0);
     out[0..4].copy_from_slice(&MAGIC);
     out[4] = VERSION;
     out[5] = p.flags;
-    out[6] = p.name.len() as u8;
+    // SAFETY: name.len() <= NAME_MAX == 32, so it always fits in a u8.
+    #[allow(clippy::cast_possible_truncation)]
+    let name_len_byte = p.name.len() as u8;
+    out[6] = name_len_byte;
     out[7] = 0;
     out[8..40].copy_from_slice(&p.pubkey);
     out[40..48].copy_from_slice(&p.peer_fpr);
@@ -54,6 +64,19 @@ pub fn encode_body(p: &BeaconPacket, out: &mut [u8; PACKET_LEN]) -> Result<(), P
 }
 
 /// Decode a packet from raw bytes. Does NOT verify the signature.
+///
+/// # Errors
+///
+/// Returns [`PacketError::Short`] if `buf` is shorter than [`PACKET_LEN`],
+/// [`PacketError::BadMagic`] if the magic bytes do not match,
+/// [`PacketError::BadVersion`] if the version field is not [`VERSION`],
+/// [`PacketError::BadNameLen`] if the encoded name length exceeds [`NAME_MAX`], or
+/// [`PacketError::BadName`] if the name bytes are not valid UTF-8.
+///
+/// # Panics
+///
+/// Never panics. The `try_into().unwrap()` on the timestamp slice is infallible because
+/// the slice is explicitly bounds-checked to exactly 8 bytes before the call.
 pub fn decode(buf: &[u8]) -> Result<(BeaconPacket, [u8; SIG_LEN]), PacketError> {
     if buf.len() < PACKET_LEN {
         return Err(PacketError::Short);
@@ -111,7 +134,7 @@ pub fn fingerprint_str(fpr: &[u8; FPR_LEN]) -> String {
         if i > 0 {
             s.push(':');
         }
-        s.push_str(&format!("{b:02x}"));
+        write!(s, "{b:02x}").unwrap();
     }
     s
 }
@@ -125,7 +148,7 @@ mod tests {
             flags: FLAG_PAIRING,
             pubkey: [7_u8; PUBKEY_LEN],
             peer_fpr: [0_u8; FPR_LEN],
-            timestamp_us: 0xCAFEBABE_DEADBEEF,
+            timestamp_us: 0xCAFE_BABE_DEAD_BEEF,
             name: "deck-living-room".to_owned(),
         }
     }
@@ -168,5 +191,20 @@ mod tests {
     fn fingerprint_format() {
         let fpr = [0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff, 0x11, 0x22];
         assert_eq!(fingerprint_str(&fpr), "aa:bb:cc:dd:ee:ff:11:22");
+    }
+
+    #[test]
+    fn rejects_short_buf() {
+        let buf = [0_u8; PACKET_LEN - 1];
+        assert!(matches!(decode(&buf), Err(PacketError::Short)));
+    }
+
+    #[test]
+    fn rejects_bad_utf8_name() {
+        let mut buf = [0_u8; PACKET_LEN];
+        encode_body(&sample(), &mut buf).unwrap();
+        buf[6] = 1;        // name_len = 1
+        buf[56] = 0xFF;    // first name byte: not valid UTF-8
+        assert!(matches!(decode(&buf), Err(PacketError::BadName)));
     }
 }
