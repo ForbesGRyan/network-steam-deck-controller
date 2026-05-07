@@ -5,7 +5,6 @@
 //! Mismatches manifest as `ERROR_INVALID_FUNCTION` when the IOCTL is
 //! issued — annoying to debug, easy to prevent.
 
-#![cfg(windows)]
 #![allow(
     clippy::missing_errors_doc,
     clippy::missing_panics_doc,

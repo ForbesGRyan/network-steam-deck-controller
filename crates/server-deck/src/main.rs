@@ -1,15 +1,15 @@
-//! Spike: open a Deck hidraw device, parse input reports, optionally send
-//! them as wire packets to the Windows client. When run with a target
-//! address, also listens on `DEFAULT_PORT` for OUTPUT-channel packets and
-//! writes them straight back into the controller as feature reports —
-//! that's the haptic / rumble path.
+//! Steam Deck server: open a hidraw device, parse input reports, send them
+//! as wire packets to the Windows client. Listens on `OUTPUT_LISTEN_PORT`
+//! for OUTPUT-channel packets (rumble/haptic) and writes them back into the
+//! controller as HID feature reports. Peer discovery uses the `discovery`
+//! crate: the binary broadcasts signed beacons and tracks the live peer
+//! address without a hard-coded IP.
 //!
 //! Usage:
 //! ```text
-//! server-deck <hidraw-device>                         # read-only, print only
-//! server-deck <hidraw-device> <target-addr:port>      # full duplex: read +
-//!                                                     # send via UDP, also
-//!                                                     # accept OUTPUT pkts
+//! server-deck <hidraw-device>                         # normal mode
+//! server-deck pair <hidraw-device>                    # one-shot pair
+//! server-deck <hidraw-device> --state-dir <path>      # override state dir
 //! ```
 //!
 //! Find the right hidraw node on a Deck:
@@ -57,6 +57,7 @@ mod linux {
     use std::io::{Read, Write};
     use std::net::{Ipv4Addr, SocketAddr, UdpSocket};
     use std::os::unix::io::AsRawFd;
+    use std::path::PathBuf;
     use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
     use deck_protocol::auth::REPLAY_WINDOW_US;
@@ -77,54 +78,132 @@ mod linux {
         send_errors: u64,
     }
 
-    pub fn run() {
-        let (path, target) = parse_args();
-        let auth_key = load_auth_key();
+    enum Mode { Run, Pair }
 
-        let socket = target.map(open_socket);
-
-        match target {
-            Some(t) => eprintln!("reading {path} -> {t} (Ctrl-C to quit)"),
-            None => eprintln!("reading {path} (read-only) (Ctrl-C to quit)"),
-        }
-
-        // Output thread: only spawned when we're in send mode. The Deck has
-        // nothing useful to do with rumble traffic if there's no Windows
-        // peer to drive it. Each thread opens its own hidraw fd so we can
-        // re-open one side without disturbing the other.
-        if target.is_some() {
-            let path_for_output = path.clone();
-            let key_for_output = auth_key.clone();
-            std::thread::Builder::new()
-                .name("deck-output".into())
-                .spawn(move || run_output_loop(&path_for_output, key_for_output.as_ref()))
-                .ok();
-        }
-
-        run_input_loop(&path, target, socket, auth_key.as_ref());
+    struct ParsedArgs {
+        mode: Mode,
+        hidraw_path: String,
+        state_dir: PathBuf,
     }
 
-    /// Load `NETWORK_DECK_KEY` from the environment. Empty / unset = no key
-    /// (dev mode, plaintext). Bad hex makes us exit — the alternative
-    /// (silently fall back to plaintext) is a footgun that has bitten every
-    /// "either auth or no auth" config we've ever shipped.
-    fn load_auth_key() -> Option<AuthKey> {
-        match std::env::var("NETWORK_DECK_KEY") {
-            Ok(s) if !s.trim().is_empty() => match AuthKey::from_hex(&s) {
-                Ok(k) => {
-                    eprintln!("auth: NETWORK_DECK_KEY loaded; secure mode");
-                    Some(k)
+    fn parse_args() -> ParsedArgs {
+        let mut args = std::env::args().skip(1);
+        let mut mode = Mode::Run;
+        let mut hidraw_path: Option<String> = None;
+        let mut state_dir_override: Option<PathBuf> = None;
+        while let Some(a) = args.next() {
+            match a.as_str() {
+                "pair" => mode = Mode::Pair,
+                "--state-dir" => {
+                    state_dir_override = args.next().map(PathBuf::from).or_else(|| {
+                        eprintln!("--state-dir requires a value");
+                        std::process::exit(2);
+                    });
                 }
-                Err(e) => {
-                    eprintln!("auth: NETWORK_DECK_KEY parse error: {e:?}");
-                    std::process::exit(2);
+                other => {
+                    if hidraw_path.is_none() {
+                        hidraw_path = Some(other.to_owned());
+                    } else {
+                        eprintln!("unexpected argument: {other}");
+                        std::process::exit(2);
+                    }
                 }
-            },
-            _ => {
-                eprintln!("auth: NETWORK_DECK_KEY unset; running in plaintext (dev mode)");
-                None
             }
         }
+        let hidraw_path = hidraw_path.unwrap_or_else(|| {
+            eprintln!("usage: server-deck [pair] <hidraw-device> [--state-dir <path>]");
+            std::process::exit(2);
+        });
+        let state_dir = state_dir_override.unwrap_or_else(|| {
+            discovery::state_dir::default_state_dir().unwrap_or_else(|e| {
+                eprintln!("cannot resolve state dir: {e:?}");
+                std::process::exit(1);
+            })
+        });
+        ParsedArgs { mode, hidraw_path, state_dir }
+    }
+
+    pub fn run() {
+        let args = parse_args();
+        let identity = std::sync::Arc::new(
+            discovery::identity::load_or_generate(&args.state_dir).unwrap_or_else(|e| {
+                eprintln!("identity load: {e:?}");
+                std::process::exit(1);
+            }),
+        );
+
+        if matches!(args.mode, Mode::Pair) {
+            run_pair_mode(&identity, &args.state_dir);
+            return;
+        }
+
+        let trusted = match discovery::trust::load(&args.state_dir) {
+            Ok(Some(p)) => std::sync::Arc::new(p),
+            Ok(None) => {
+                eprintln!(
+                    "no trusted peer; run `server-deck pair {}` to pair first",
+                    args.hidraw_path,
+                );
+                std::process::exit(1);
+            }
+            Err(e) => {
+                eprintln!("trust load: {e:?}");
+                std::process::exit(1);
+            }
+        };
+
+        let bound = match UdpSocket::bind((Ipv4Addr::UNSPECIFIED, OUTPUT_LISTEN_PORT)) {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("bind 0.0.0.0:{OUTPUT_LISTEN_PORT}: {e}");
+                std::process::exit(1);
+            }
+        };
+
+        let beacon = std::sync::Arc::new(
+            discovery::Beacon::new(
+                identity.clone(),
+                trusted.clone(),
+                SocketAddr::new(Ipv4Addr::BROADCAST.into(), OUTPUT_LISTEN_PORT),
+                hostname(),
+                OUTPUT_LISTEN_PORT,
+            )
+            .unwrap_or_else(|e| {
+                eprintln!("beacon init: {e:?}");
+                std::process::exit(1);
+            }),
+        );
+        discovery::beacon::spawn_broadcast(beacon.clone());
+        let auth_key = Some(deck_protocol::AuthKey::from_bytes(beacon.session_key()));
+
+        eprintln!(
+            "reading {path} -> peer {name} ({fpr}) (Ctrl-C to quit)",
+            path = args.hidraw_path,
+            name = trusted.name,
+            fpr = identity.fingerprint_str(),
+        );
+
+        // Output thread: dequeues output packets from `bound`. Pass the
+        // beacon in too so its handle_packet() sees beacon traffic on the
+        // shared port.
+        let path_for_output = args.hidraw_path.clone();
+        let beacon_for_output = beacon.clone();
+        let bound_for_output = bound.try_clone().expect("clone bound socket");
+        std::thread::Builder::new()
+            .name("deck-output".into())
+            .spawn(move || run_output_loop(
+                &path_for_output,
+                auth_key.as_ref(),
+                bound_for_output,
+                beacon_for_output,
+            ))
+            .ok();
+
+        run_input_loop(&args.hidraw_path, beacon, auth_key.as_ref());
+    }
+
+    fn hostname() -> String {
+        std::env::var("HOSTNAME").unwrap_or_else(|_| "deck".to_owned())
     }
 
     /// Open hidraw read-write, falling back to read-only if RW fails (the
@@ -164,8 +243,7 @@ mod linux {
 
     fn run_input_loop(
         path: &str,
-        target: Option<SocketAddr>,
-        socket: Option<UdpSocket>,
+        beacon: std::sync::Arc<discovery::Beacon>,
         auth_key: Option<&AuthKey>,
     ) {
         let mut file = wait_for_hidraw(path);
@@ -176,22 +254,16 @@ mod linux {
         let mut last_state: Option<ControllerState> = None;
         let mut last_print = Instant::now();
         let mut stdout = std::io::stdout();
+        // Send socket: ephemeral; data plane sends to the live peer addr.
+        let sock = UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0)).expect("bind ephemeral send sock");
 
         loop {
             match read_one(&mut file, &mut hid_buf) {
                 ReadResult::Ok => {
                     if let Some(state) = decode_or_skip(&hid_buf, &mut stats) {
                         stats.frames += 1;
-                        if let (Some(s), Some(t)) = (socket.as_ref(), target) {
-                            send_packet(
-                                s,
-                                t,
-                                &state,
-                                sequence,
-                                auth_key,
-                                &mut wire_buf,
-                                &mut stats,
-                            );
+                        if let Some(target) = beacon.current_peer() {
+                            send_packet(&sock, target, &state, sequence, auth_key, &mut wire_buf, &mut stats);
                             sequence = sequence.wrapping_add(1);
                         }
                         last_state = Some(state);
@@ -210,7 +282,7 @@ mod linux {
             // tell the device is alive but not in gamepad mode.
             if last_print.elapsed() >= PRINT_EVERY {
                 last_print = Instant::now();
-                print_status(&mut stdout, &stats, last_state.as_ref());
+                print_status(&mut stdout, &stats, last_state.as_ref(), beacon.current_peer_with_age());
             }
         }
     }
@@ -220,19 +292,17 @@ mod linux {
     /// back into the Deck's hidraw via `HIDIOCSFEATURE`. Re-opens the
     /// hidraw fd if a write fails persistently — the same recovery story
     /// as the input loop, with its own state so neither blocks the other.
-    fn run_output_loop(path: &str, auth_key: Option<&AuthKey>) {
-        let bind = SocketAddr::new(Ipv4Addr::UNSPECIFIED.into(), OUTPUT_LISTEN_PORT);
-        let sock = match UdpSocket::bind(bind) {
-            Ok(s) => s,
-            Err(e) => {
-                eprintln!("\noutput: bind {bind}: {e}");
-                return;
-            }
-        };
-        eprintln!("output: listening on {bind} for rumble/haptic packets");
+    /// Also demuxes discovery beacon packets on the same port.
+    fn run_output_loop(
+        path: &str,
+        auth_key: Option<&AuthKey>,
+        sock: UdpSocket,
+        beacon: std::sync::Arc<discovery::Beacon>,
+    ) {
+        eprintln!("output: listening on 0.0.0.0:{OUTPUT_LISTEN_PORT} for rumble/haptic packets");
 
         let mut write_fd = wait_for_hidraw(path);
-        let mut buf = [0_u8; OUTPUT_PACKET_LEN];
+        let mut buf = [0_u8; OUTPUT_PACKET_LEN.max(discovery::packet::PACKET_LEN)];
         // Feature reports go through HIDIOCSFEATURE with byte 0 reserved
         // for the report ID. Our HID descriptor declares no report IDs, so
         // byte 0 is always zero; bytes 1..65 carry the 64 payload bytes.
@@ -251,13 +321,20 @@ mod linux {
         let mut last_log = Instant::now();
 
         loop {
-            let n = match sock.recv_from(&mut buf) {
-                Ok((n, _src)) => n,
+            let (n, src) = match sock.recv_from(&mut buf) {
+                Ok(v) => v,
                 Err(e) => {
                     eprintln!("\noutput: recv: {e}");
                     continue;
                 }
             };
+
+            // Demux beacon vs data.
+            if n >= 4 && buf[0..4] == *discovery::BEACON_MAGIC {
+                beacon.handle_packet(src, &buf[..n]);
+                continue;
+            }
+
             received += 1;
             if n != OUTPUT_PACKET_LEN {
                 continue;
@@ -426,37 +503,6 @@ mod linux {
         }
     }
 
-    fn parse_args() -> (String, Option<SocketAddr>) {
-        let args: Vec<String> = std::env::args().collect();
-        match args.as_slice() {
-            [_, path] => (path.clone(), None),
-            [_, path, target] => match target.parse() {
-                Ok(addr) => (path.clone(), Some(addr)),
-                Err(e) => {
-                    eprintln!("bad target {target}: {e}");
-                    std::process::exit(2);
-                }
-            },
-            _ => {
-                eprintln!("usage: server-deck <hidraw-device> [target-addr:port]");
-                eprintln!("  full-duplex:    server-deck /dev/hidraw3 192.168.1.50:49152");
-                eprintln!("  read-only mode: server-deck /dev/hidraw3");
-                std::process::exit(2);
-            }
-        }
-    }
-
-    fn open_socket(target: SocketAddr) -> UdpSocket {
-        let bind = if target.is_ipv6() { "[::]:0" } else { "0.0.0.0:0" };
-        match UdpSocket::bind(bind) {
-            Ok(s) => s,
-            Err(e) => {
-                eprintln!("bind {bind}: {e}");
-                std::process::exit(1);
-            }
-        }
-    }
-
     /// Low 32 bits of wall-clock microseconds since Unix epoch.
     /// Truncation is intentional — the wire format defines exactly that.
     #[allow(clippy::cast_possible_truncation)]
@@ -467,10 +513,22 @@ mod linux {
             .unwrap_or(0)
     }
 
-    fn print_status<W: Write>(out: &mut W, stats: &Stats, state: Option<&ControllerState>) {
+    fn print_status<W: Write>(
+        out: &mut W,
+        stats: &Stats,
+        state: Option<&ControllerState>,
+        peer: Option<(SocketAddr, Duration)>,
+    ) {
+        let peer_str = match peer {
+            None => "peer: searching".to_owned(),
+            Some((a, age)) if age > discovery::beacon::STALE_AFTER => {
+                format!("peer: {a} age {:.1}s STALE", age.as_secs_f64())
+            }
+            Some((a, age)) => format!("peer: {a} age {:.1}s", age.as_secs_f64()),
+        };
         let _ = write!(
             out,
-            "\x1b[2K\rframes={:>7} skipped={:>5} sent={:>7} senderr={:>4}",
+            "\x1b[2K\rframes={:>7} skipped={:>5} sent={:>7} senderr={:>4} {peer_str}",
             stats.frames, stats.skipped, stats.sent, stats.send_errors,
         );
         if let Some(state) = state {
@@ -501,5 +559,36 @@ mod linux {
             let _ = write!(out, " (no Deck-state frames yet)");
         }
         let _ = out.flush();
+    }
+
+    fn run_pair_mode(identity: &std::sync::Arc<discovery::Identity>, state_dir: &std::path::Path) {
+        let sock = match UdpSocket::bind((Ipv4Addr::UNSPECIFIED, OUTPUT_LISTEN_PORT)) {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("bind for pair: {e}");
+                std::process::exit(1);
+            }
+        };
+        sock.set_broadcast(true).ok();
+        let cfg = discovery::pair::PairConfig {
+            identity: identity.clone(),
+            recv_sock: sock,
+            unicast_target: SocketAddr::new(Ipv4Addr::BROADCAST.into(), OUTPUT_LISTEN_PORT),
+            self_name: hostname(),
+            state_dir: state_dir.to_path_buf(),
+            timeout: Duration::from_secs(120),
+        };
+        eprintln!("pairing — fingerprint {}; waiting up to 120 s", identity.fingerprint_str());
+        let mut stdin = std::io::stdin();
+        let mut stderr = std::io::stderr();
+        match discovery::pair::run_pair(&cfg, &mut stdin, &mut stderr) {
+            discovery::pair::PairOutcome::Paired(p) => {
+                eprintln!("paired with {} (fingerprint stored)", p.name);
+            }
+            other => {
+                eprintln!("pair did not complete: {other:?}");
+                std::process::exit(1);
+            }
+        }
     }
 }

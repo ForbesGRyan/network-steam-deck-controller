@@ -11,8 +11,9 @@
 //! HID-encode path still executes as a self-test of the protocol crate).
 //!
 //! Usage:
-//!   client-win [port]            - listen on UDP `port` for Deck input
-//!                                  packets (default 49152)
+//!   client-win                   - normal mode (requires prior pairing)
+//!   client-win pair              - one-shot pairing flow
+//!   client-win --state-dir <p>   - override state directory
 //!   client-win --test            - drive the IOCTL with a canned state
 //!                                  pattern (alternates neutral / A
 //!                                  pressed each second). Useful for
@@ -53,25 +54,99 @@ struct Stats {
     last_seq: Option<u32>,
 }
 
-fn main() {
+enum Mode {
+    Run,
+    Pair,
+    Test,
+    Replay(String),
+}
+
+struct ParsedArgs {
+    mode: Mode,
+    state_dir: std::path::PathBuf,
+}
+
+fn parse_args() -> ParsedArgs {
     let mut args = std::env::args().skip(1);
-    let arg = args.next();
-    if matches!(arg.as_deref(), Some("--test")) {
-        run_test_mode();
-        return;
+    let mut mode = Mode::Run;
+    let mut state_dir_override: Option<std::path::PathBuf> = None;
+
+    while let Some(a) = args.next() {
+        match a.as_str() {
+            "--test" => mode = Mode::Test,
+            "--replay" => {
+                let Some(path) = args.next() else {
+                    eprintln!("usage: client-win --replay <path-to-hidraw-capture>");
+                    std::process::exit(2);
+                };
+                mode = Mode::Replay(path);
+            }
+            "pair" => mode = Mode::Pair,
+            "--state-dir" => {
+                state_dir_override = args.next().map(std::path::PathBuf::from).or_else(|| {
+                    eprintln!("--state-dir requires a value");
+                    std::process::exit(2);
+                });
+            }
+            other => {
+                eprintln!("unexpected argument: {other}");
+                std::process::exit(2);
+            }
+        }
     }
-    if matches!(arg.as_deref(), Some("--replay")) {
-        let Some(path) = args.next() else {
-            eprintln!("usage: client-win --replay <path-to-hidraw-capture>");
-            std::process::exit(2);
-        };
-        run_replay_mode(&path);
+
+    let state_dir = state_dir_override.unwrap_or_else(|| {
+        discovery::state_dir::default_state_dir().unwrap_or_else(|e| {
+            eprintln!("cannot resolve state dir: {e:?}");
+            std::process::exit(1);
+        })
+    });
+
+    ParsedArgs { mode, state_dir }
+}
+
+fn main() {
+    let args = parse_args();
+
+    // --test and --replay skip identity/trust/network entirely.
+    match args.mode {
+        Mode::Test => {
+            run_test_mode();
+            return;
+        }
+        Mode::Replay(ref path) => {
+            run_replay_mode(path);
+            return;
+        }
+        _ => {}
+    }
+
+    let identity = Arc::new(
+        discovery::identity::load_or_generate(&args.state_dir).unwrap_or_else(|e| {
+            eprintln!("identity load: {e:?}");
+            std::process::exit(1);
+        }),
+    );
+
+    if matches!(args.mode, Mode::Pair) {
+        run_pair_mode(&identity, &args.state_dir);
         return;
     }
 
-    let port: u16 = arg.and_then(|s| s.parse().ok()).unwrap_or(DEFAULT_PORT);
+    // Normal mode: require a trusted peer.
+    let trusted = match discovery::trust::load(&args.state_dir) {
+        Ok(Some(p)) => Arc::new(p),
+        Ok(None) => {
+            eprintln!("no trusted peer; run `client-win pair` to pair first");
+            std::process::exit(1);
+        }
+        Err(e) => {
+            eprintln!("trust load: {e:?}");
+            std::process::exit(1);
+        }
+    };
 
-    let bind = SocketAddr::new(Ipv4Addr::UNSPECIFIED.into(), port);
+    let bind = SocketAddr::new(Ipv4Addr::UNSPECIFIED.into(), DEFAULT_PORT);
     let sock = match UdpSocket::bind(bind) {
         Ok(s) => s,
         Err(e) => {
@@ -81,9 +156,27 @@ fn main() {
     };
     let _ = sock.set_read_timeout(Some(RECV_TIMEOUT));
 
-    eprintln!("client-win listening on {bind} (Ctrl-C to quit)");
+    let beacon = Arc::new(
+        discovery::Beacon::new(
+            identity.clone(),
+            trusted.clone(),
+            SocketAddr::new(Ipv4Addr::BROADCAST.into(), DEFAULT_PORT),
+            hostname(),
+            DEFAULT_PORT,
+        )
+        .unwrap_or_else(|e| {
+            eprintln!("beacon init: {e:?}");
+            std::process::exit(1);
+        }),
+    );
+    discovery::beacon::spawn_broadcast(beacon.clone());
+    let auth_key = Some(AuthKey::from_bytes(beacon.session_key()));
 
-    let auth_key = load_auth_key();
+    eprintln!(
+        "client-win listening on {bind} (Ctrl-C to quit) — peer {} fingerprint {}",
+        trusted.name,
+        identity.fingerprint_str(),
+    );
 
     // Latest input-packet source address. The output (rumble) thread reads
     // this so it can ship feedback back to whichever Deck most recently
@@ -97,7 +190,10 @@ fn main() {
     eprintln!("driver IPC: requires Windows; running listen-only");
 
     let mut stats = Stats::default();
-    let mut buf = [0_u8; INPUT_PACKET_LEN];
+    // Buffer sized to accommodate either an INPUT_PACKET_LEN data packet or a
+    // full beacon PACKET_LEN so the demux check can read the magic bytes.
+    let buf_cap = INPUT_PACKET_LEN.max(discovery::packet::PACKET_LEN);
+    let mut buf = vec![0_u8; buf_cap];
     // Driver IOCTL expects exactly DECK_INPUT_REPORT_SIZE (64) bytes; the
     // protocol crate's encode produces hid::REPORT_LEN (60) — pad with the
     // zero tail so the trailing 4 bytes match what real Deck firmware sends.
@@ -107,9 +203,16 @@ fn main() {
     let mut diag = RecvDiag::new(bind);
 
     loop {
-        let Some(n) = diag.recv(&sock, &mut buf, &latest_src) else {
+        let Some((n, src)) = diag.recv(&sock, &mut buf, &latest_src) else {
             continue;
         };
+
+        // Beacon demux: if the packet starts with BEACON_MAGIC, hand it to
+        // the beacon and continue — it's not a data packet.
+        if n >= 4 && buf[0..4] == discovery::BEACON_MAGIC {
+            beacon.handle_packet(src, &buf[..n]);
+            continue;
+        }
 
         let Some((hdr, state)) = parse_packet(&buf, n, auth_key.as_ref(), &mut stats) else {
             continue;
@@ -129,7 +232,7 @@ fn main() {
         stats.packets += 1;
         if last_print.elapsed() >= PRINT_EVERY {
             last_print = Instant::now();
-            print_status(&mut stdout, &stats, &hdr, &state);
+            print_status(&mut stdout, &stats, &hdr, &state, beacon.current_peer_with_age());
         }
     }
 }
@@ -167,7 +270,7 @@ impl RecvDiag {
         sock: &UdpSocket,
         buf: &mut [u8],
         latest_src: &Mutex<Option<SocketAddr>>,
-    ) -> Option<usize> {
+    ) -> Option<(usize, SocketAddr)> {
         match sock.recv_from(buf) {
             Ok((n, src)) => {
                 self.total_received += 1;
@@ -188,7 +291,7 @@ impl RecvDiag {
                         self.total_received, self.total_recv_bytes,
                     );
                 }
-                Some(n)
+                Some((n, src))
             }
             Err(e)
                 if matches!(
@@ -249,32 +352,23 @@ fn parse_packet(
     Some((hdr, state))
 }
 
-/// Load `NETWORK_DECK_KEY` from the environment. Mirrors the server side:
-/// missing/empty -> plaintext (dev mode); bad hex -> exit so the operator
-/// notices instead of silently falling back.
-fn load_auth_key() -> Option<AuthKey> {
-    match std::env::var("NETWORK_DECK_KEY") {
-        Ok(s) if !s.trim().is_empty() => match AuthKey::from_hex(&s) {
-            Ok(k) => {
-                eprintln!("auth: NETWORK_DECK_KEY loaded; secure mode");
-                Some(k)
-            }
-            Err(e) => {
-                eprintln!("auth: NETWORK_DECK_KEY parse error: {e:?}");
-                std::process::exit(2);
-            }
-        },
-        _ => {
-            eprintln!("auth: NETWORK_DECK_KEY unset; running in plaintext (dev mode)");
-            None
+fn print_status<W: Write>(
+    out: &mut W,
+    stats: &Stats,
+    hdr: &Header,
+    state: &ControllerState,
+    peer: Option<(SocketAddr, Duration)>,
+) {
+    let peer_str = match peer {
+        None => "peer: searching".to_owned(),
+        Some((a, age)) if age > discovery::beacon::STALE_AFTER => {
+            format!("peer: {a} age {:.1}s STALE", age.as_secs_f64())
         }
-    }
-}
-
-fn print_status<W: Write>(out: &mut W, stats: &Stats, hdr: &Header, state: &ControllerState) {
+        Some((a, age)) => format!("peer: {a} age {:.1}s", age.as_secs_f64()),
+    };
     let _ = write!(
         out,
-        "\x1b[2K\rpkts={:>7} drop={:>5} err={:>4} push={:>7} perr={:>4} \
+        "\x1b[2K\r{peer_str} pkts={:>7} drop={:>5} err={:>4} push={:>7} perr={:>4} \
          seq_hdr={:>10} \
          L({:>+6},{:>+6}) R({:>+6},{:>+6}) \
          LT={:>5} RT={:>5} \
@@ -445,9 +539,11 @@ fn run_replay_mode(path: &str) {
             // the firmware interleaves into the hidraw stream. Only frames
             // that parse to a ControllerState get pushed; otherwise Steam
             // sees garbage button bytes and the controller appears stuck.
-            let parsed: [u8; hid::REPORT_LEN] = match chunk.try_into() {
-                Ok(arr) => arr,
-                Err(_) => { skipped += 1; continue; }
+            let parsed: [u8; hid::REPORT_LEN] = if let Ok(arr) = chunk.try_into() {
+                arr
+            } else {
+                skipped += 1;
+                continue;
             };
             if hid::parse_input_report(&parsed).is_err() {
                 skipped += 1;
@@ -562,4 +658,41 @@ fn now_us_low32() -> u32 {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_micros() as u32)
         .unwrap_or(0)
+}
+
+fn hostname() -> String {
+    std::env::var("COMPUTERNAME")
+        .or_else(|_| std::env::var("HOSTNAME"))
+        .unwrap_or_else(|_| "windows".to_owned())
+}
+
+fn run_pair_mode(identity: &Arc<discovery::Identity>, state_dir: &std::path::Path) {
+    let sock = match UdpSocket::bind((Ipv4Addr::UNSPECIFIED, DEFAULT_PORT)) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("bind for pair: {e}");
+            std::process::exit(1);
+        }
+    };
+    sock.set_broadcast(true).ok();
+    let cfg = discovery::pair::PairConfig {
+        identity: identity.clone(),
+        recv_sock: sock,
+        unicast_target: SocketAddr::new(Ipv4Addr::BROADCAST.into(), DEFAULT_PORT),
+        self_name: hostname(),
+        state_dir: state_dir.to_path_buf(),
+        timeout: Duration::from_secs(120),
+    };
+    eprintln!("pairing — fingerprint {}; waiting up to 120 s", identity.fingerprint_str());
+    let mut stdin = std::io::stdin();
+    let mut stderr = std::io::stderr();
+    match discovery::pair::run_pair(&cfg, &mut stdin, &mut stderr) {
+        discovery::pair::PairOutcome::Paired(p) => {
+            eprintln!("paired with {} (fingerprint stored)", p.name);
+        }
+        other => {
+            eprintln!("pair did not complete: {other:?}");
+            std::process::exit(1);
+        }
+    }
 }

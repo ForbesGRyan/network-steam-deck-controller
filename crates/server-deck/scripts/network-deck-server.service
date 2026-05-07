@@ -5,13 +5,11 @@
 #   sudo systemctl daemon-reload
 #   sudo systemctl enable --now network-deck-server.service
 #
-# Customize the ExecStart hidraw path and target IP for your setup. The
-# unit relies on a udev rule granting non-root access to the Deck's
-# hidraw node — see crates/server-deck/scripts/70-steam-deck.rules.
-#
-# To run with HMAC-authenticated packets, set NETWORK_DECK_KEY in
-# /etc/network-deck.env (a 64-char hex string). Both Deck and the Windows
-# client must use the same key.
+# First-time setup: pair with the Windows PC by running
+#   sudo systemctl stop network-deck-server.service
+#   sudo -u deck /usr/local/bin/server-deck pair /dev/hidraw3 --state-dir /var/lib/network-deck
+# while `client-win pair` is running on the PC, then re-enable the unit.
+# (`/var/lib/network-deck` is owned by the `deck` user via `StateDirectory=`)
 
 [Unit]
 Description=Network Deck input bridge (Steam Deck -> Windows)
@@ -24,25 +22,14 @@ Type=simple
 User=deck
 Group=deck
 
-# Drop the path to the controller hidraw node and the Windows client's
-# IP:port here. Match the port to client-win's listen port (default 49152).
 Environment=DECK_HIDRAW=/dev/hidraw3
-Environment=DECK_TARGET=192.168.1.50:49152
+StateDirectory=network-deck
 
-# Optional: shared HMAC key for authenticated packets. Empty string =
-# plaintext (dev mode). To enable, write a 64-char hex key in
-# /etc/network-deck.env as `NETWORK_DECK_KEY=...`.
-EnvironmentFile=-/etc/network-deck.env
+ExecStart=/usr/local/bin/server-deck ${DECK_HIDRAW} --state-dir /var/lib/network-deck
 
-ExecStart=/usr/local/bin/server-deck ${DECK_HIDRAW} ${DECK_TARGET}
-
-# Crash recovery. server-deck already re-opens hidraw on transient errors;
-# the systemd restart catches the rare case where a panic escapes that
-# recovery (or where hidraw is missing for >max_delay).
 Restart=on-failure
 RestartSec=5
 
-# Hardening: the server only needs hidraw access plus UDP egress/ingress.
 NoNewPrivileges=true
 ProtectSystem=strict
 ProtectHome=true

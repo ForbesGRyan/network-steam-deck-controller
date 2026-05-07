@@ -177,6 +177,20 @@ Signing path:
    `pnputil` and `devcon`. `crates/server-deck/scripts/`
    ships a systemd unit and a udev rule. Release-profile is `lto = "thin"`
    + `codegen-units = 1` for a small / fast binary.*
+9. ✅ LAN discovery + first-time pairing.
+   *Symmetric UDP-broadcast beacon on UDP 49152 with magic `NDB1`.
+   Long-lived Ed25519 identity per peer; signed beacons; HKDF-derived
+   session key feeds the existing per-packet HMAC. `pair` subcommand on
+   each binary runs a 120 s mutual-confirm flow; on success both ends
+   write `trusted-peers.toml` to the platform state dir
+   (`%LOCALAPPDATA%\network-deck` / `~/.local/state/network-deck` /
+   `/var/lib/network-deck` under systemd). Replaces the
+   `NETWORK_DECK_KEY` env var and the `<windows-ip>:port` CLI argument.
+   Manual validation:
+   - Pair on real hardware; confirm both fingerprints match visibly.
+   - Reboot both ends; data plane resumes without re-pair.
+   - Old `server-deck` binary against new `client-win` fails fast
+     with the "run pair" message — no silent breakage.*
 
 ## Pending validations
 
