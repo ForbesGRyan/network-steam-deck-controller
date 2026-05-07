@@ -15,11 +15,13 @@
 
 #![no_std]
 
+pub mod auth;
 pub mod buttons;
 pub mod hid;
 pub mod state;
 pub mod wire;
 
+pub use auth::{AuthKey, KeyError};
 pub use buttons::Buttons;
 pub use state::{ControllerState, Stick, Trackpad, Vec3i};
 pub use wire::{Channel, Header, WireError};

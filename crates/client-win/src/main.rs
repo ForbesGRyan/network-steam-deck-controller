@@ -30,9 +30,10 @@ use std::net::{Ipv4Addr, SocketAddr, UdpSocket};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use deck_protocol::auth::REPLAY_WINDOW_US;
 use deck_protocol::hid;
-use deck_protocol::wire::{self, Channel, Header, HEADER_LEN, INPUT_PACKET_LEN, OUTPUT_PACKET_LEN};
-use deck_protocol::{Buttons, ControllerState};
+use deck_protocol::wire::{self, Channel, Header, INPUT_PACKET_LEN, OUTPUT_PACKET_LEN};
+use deck_protocol::{AuthKey, Buttons, ControllerState};
 
 #[cfg(windows)]
 mod driver;
@@ -46,6 +47,7 @@ struct Stats {
     packets: u64,
     dropped: u64,
     wire_errors: u64,
+    auth_drops: u64,
     pushed: u64,
     push_errors: u64,
     last_seq: Option<u32>,
@@ -81,6 +83,8 @@ fn main() {
 
     eprintln!("client-win listening on {bind} (Ctrl-C to quit)");
 
+    let auth_key = load_auth_key();
+
     // Latest input-packet source address. The output (rumble) thread reads
     // this so it can ship feedback back to whichever Deck most recently
     // reached us — no separate config flag, the pairing is implicit in the
@@ -88,7 +92,7 @@ fn main() {
     let latest_src: Arc<Mutex<Option<SocketAddr>>> = Arc::new(Mutex::new(None));
 
     #[cfg(windows)]
-    let driver = spawn_driver_with_pend_thread(&sock, &latest_src);
+    let driver = spawn_driver_with_pend_thread(&sock, &latest_src, auth_key.clone());
     #[cfg(not(windows))]
     eprintln!("driver IPC: requires Windows; running listen-only");
 
@@ -107,7 +111,7 @@ fn main() {
             continue;
         };
 
-        let Some((hdr, state)) = parse_packet(&buf, n, &mut stats) else {
+        let Some((hdr, state)) = parse_packet(&buf, n, auth_key.as_ref(), &mut stats) else {
             continue;
         };
 
@@ -209,20 +213,29 @@ impl RecvDiag {
     }
 }
 
-fn parse_packet(buf: &[u8], n: usize, stats: &mut Stats) -> Option<(Header, ControllerState)> {
-    if n < HEADER_LEN {
-        stats.wire_errors += 1;
-        return None;
-    }
-    let Ok(hdr) = wire::decode_header(&buf[..HEADER_LEN]) else {
-        stats.wire_errors += 1;
-        return None;
-    };
-    if hdr.channel != Channel::Input {
-        return None;
-    }
+fn parse_packet(
+    buf: &[u8],
+    n: usize,
+    auth_key: Option<&AuthKey>,
+    stats: &mut Stats,
+) -> Option<(Header, ControllerState)> {
     if n != INPUT_PACKET_LEN {
         stats.wire_errors += 1;
+        return None;
+    }
+    let (hdr, state) =
+        match wire::decode_input_packet(&buf[..INPUT_PACKET_LEN], auth_key, now_us_low32(), REPLAY_WINDOW_US) {
+            Ok(v) => v,
+            Err(wire::WireError::AuthFailed | wire::WireError::Replay) => {
+                stats.auth_drops += 1;
+                return None;
+            }
+            Err(_) => {
+                stats.wire_errors += 1;
+                return None;
+            }
+        };
+    if hdr.channel != Channel::Input {
         return None;
     }
 
@@ -233,11 +246,29 @@ fn parse_packet(buf: &[u8], n: usize, stats: &mut Stats) -> Option<(Header, Cont
     }
     stats.last_seq = Some(hdr.sequence);
 
-    let Ok(state) = wire::decode_input(&buf[HEADER_LEN..INPUT_PACKET_LEN]) else {
-        stats.wire_errors += 1;
-        return None;
-    };
     Some((hdr, state))
+}
+
+/// Load `NETWORK_DECK_KEY` from the environment. Mirrors the server side:
+/// missing/empty -> plaintext (dev mode); bad hex -> exit so the operator
+/// notices instead of silently falling back.
+fn load_auth_key() -> Option<AuthKey> {
+    match std::env::var("NETWORK_DECK_KEY") {
+        Ok(s) if !s.trim().is_empty() => match AuthKey::from_hex(&s) {
+            Ok(k) => {
+                eprintln!("auth: NETWORK_DECK_KEY loaded; secure mode");
+                Some(k)
+            }
+            Err(e) => {
+                eprintln!("auth: NETWORK_DECK_KEY parse error: {e:?}");
+                std::process::exit(2);
+            }
+        },
+        _ => {
+            eprintln!("auth: NETWORK_DECK_KEY unset; running in plaintext (dev mode)");
+            None
+        }
+    }
 }
 
 fn print_status<W: Write>(out: &mut W, stats: &Stats, hdr: &Header, state: &ControllerState) {
@@ -277,6 +308,7 @@ fn print_status<W: Write>(out: &mut W, stats: &Stats, hdr: &Header, state: &Cont
 fn spawn_driver_with_pend_thread(
     sock: &UdpSocket,
     latest_src: &Arc<Mutex<Option<SocketAddr>>>,
+    auth_key: Option<AuthKey>,
 ) -> Arc<driver::DriverHolder> {
     let holder = Arc::new(driver::DriverHolder::try_init());
     let pend_handle = holder.clone();
@@ -295,7 +327,7 @@ fn spawn_driver_with_pend_thread(
     let src_handle = latest_src.clone();
     std::thread::Builder::new()
         .name("deck-pend-output".into())
-        .spawn(move || pend_output_loop(&pend_handle, &send_sock, &src_handle))
+        .spawn(move || pend_output_loop(&pend_handle, &send_sock, &src_handle, auth_key.as_ref()))
         .ok();
     holder
 }
@@ -462,6 +494,7 @@ fn pend_output_loop(
     driver: &driver::DriverHolder,
     send_sock: &UdpSocket,
     latest_src: &Arc<Mutex<Option<SocketAddr>>>,
+    auth_key: Option<&AuthKey>,
 ) {
     let mut buf = [0_u8; driver::OUTPUT_REPORT_SIZE];
     let mut wire_buf = [0_u8; OUTPUT_PACKET_LEN];
@@ -496,14 +529,13 @@ fn pend_output_loop(
 
         let hdr = Header {
             channel: Channel::Output,
+            flags: 0,
             sequence,
             timestamp_us: now_us_low32(),
         };
         sequence = sequence.wrapping_add(1);
 
-        if wire::encode_header(&hdr, &mut wire_buf[..HEADER_LEN]).is_err()
-            || wire::encode_output(&buf, &mut wire_buf[HEADER_LEN..]).is_err()
-        {
+        if wire::encode_output_packet(&hdr, &buf, auth_key, &mut wire_buf).is_err() {
             send_errors += 1;
             continue;
         }

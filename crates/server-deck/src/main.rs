@@ -59,11 +59,10 @@ mod linux {
     use std::os::unix::io::AsRawFd;
     use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+    use deck_protocol::auth::REPLAY_WINDOW_US;
     use deck_protocol::hid::{self, HidError, REPORT_LEN};
-    use deck_protocol::wire::{
-        self, Channel, Header, HEADER_LEN, INPUT_PACKET_LEN, OUTPUT_BODY_LEN, OUTPUT_PACKET_LEN,
-    };
-    use deck_protocol::ControllerState;
+    use deck_protocol::wire::{self, Channel, Header, INPUT_PACKET_LEN, OUTPUT_BODY_LEN, OUTPUT_PACKET_LEN};
+    use deck_protocol::{AuthKey, ControllerState};
 
     const PRINT_EVERY: Duration = Duration::from_millis(50);
     /// UDP port the Windows client `client-win` ships output reports to.
@@ -80,6 +79,7 @@ mod linux {
 
     pub fn run() {
         let (path, target) = parse_args();
+        let auth_key = load_auth_key();
 
         let socket = target.map(open_socket);
 
@@ -94,13 +94,37 @@ mod linux {
         // re-open one side without disturbing the other.
         if target.is_some() {
             let path_for_output = path.clone();
+            let key_for_output = auth_key.clone();
             std::thread::Builder::new()
                 .name("deck-output".into())
-                .spawn(move || run_output_loop(&path_for_output))
+                .spawn(move || run_output_loop(&path_for_output, key_for_output.as_ref()))
                 .ok();
         }
 
-        run_input_loop(&path, target, socket);
+        run_input_loop(&path, target, socket, auth_key.as_ref());
+    }
+
+    /// Load `NETWORK_DECK_KEY` from the environment. Empty / unset = no key
+    /// (dev mode, plaintext). Bad hex makes us exit — the alternative
+    /// (silently fall back to plaintext) is a footgun that has bitten every
+    /// "either auth or no auth" config we've ever shipped.
+    fn load_auth_key() -> Option<AuthKey> {
+        match std::env::var("NETWORK_DECK_KEY") {
+            Ok(s) if !s.trim().is_empty() => match AuthKey::from_hex(&s) {
+                Ok(k) => {
+                    eprintln!("auth: NETWORK_DECK_KEY loaded; secure mode");
+                    Some(k)
+                }
+                Err(e) => {
+                    eprintln!("auth: NETWORK_DECK_KEY parse error: {e:?}");
+                    std::process::exit(2);
+                }
+            },
+            _ => {
+                eprintln!("auth: NETWORK_DECK_KEY unset; running in plaintext (dev mode)");
+                None
+            }
+        }
     }
 
     /// Open hidraw read-write, falling back to read-only if RW fails (the
@@ -138,7 +162,12 @@ mod linux {
         }
     }
 
-    fn run_input_loop(path: &str, target: Option<SocketAddr>, socket: Option<UdpSocket>) {
+    fn run_input_loop(
+        path: &str,
+        target: Option<SocketAddr>,
+        socket: Option<UdpSocket>,
+        auth_key: Option<&AuthKey>,
+    ) {
         let mut file = wait_for_hidraw(path);
         let mut stats = Stats::default();
         let mut hid_buf = [0_u8; REPORT_LEN];
@@ -154,7 +183,15 @@ mod linux {
                     if let Some(state) = decode_or_skip(&hid_buf, &mut stats) {
                         stats.frames += 1;
                         if let (Some(s), Some(t)) = (socket.as_ref(), target) {
-                            send_packet(s, t, &state, sequence, &mut wire_buf, &mut stats);
+                            send_packet(
+                                s,
+                                t,
+                                &state,
+                                sequence,
+                                auth_key,
+                                &mut wire_buf,
+                                &mut stats,
+                            );
                             sequence = sequence.wrapping_add(1);
                         }
                         last_state = Some(state);
@@ -183,7 +220,7 @@ mod linux {
     /// back into the Deck's hidraw via `HIDIOCSFEATURE`. Re-opens the
     /// hidraw fd if a write fails persistently — the same recovery story
     /// as the input loop, with its own state so neither blocks the other.
-    fn run_output_loop(path: &str) {
+    fn run_output_loop(path: &str, auth_key: Option<&AuthKey>) {
         let bind = SocketAddr::new(Ipv4Addr::UNSPECIFIED.into(), OUTPUT_LISTEN_PORT);
         let sock = match UdpSocket::bind(bind) {
             Ok(s) => s,
@@ -204,6 +241,7 @@ mod linux {
         let mut received: u64 = 0;
         let mut applied: u64 = 0;
         let mut out_of_order: u64 = 0;
+        let mut auth_drops: u64 = 0;
         let mut hidraw_errors: u64 = 0;
         // Threshold for treating HIDIOCSFEATURE failures as "the fd is
         // dead, reopen." A flaky single ioctl shouldn't tear down — but a
@@ -224,8 +262,19 @@ mod linux {
             if n != OUTPUT_PACKET_LEN {
                 continue;
             }
-            let Ok(hdr) = wire::decode_header(&buf[..HEADER_LEN]) else {
-                continue;
+            let hdr = match wire::decode_output_packet(
+                &buf,
+                auth_key,
+                now_us_low32(),
+                REPLAY_WINDOW_US,
+                &mut feature_buf[1..],
+            ) {
+                Ok(h) => h,
+                Err(wire::WireError::AuthFailed | wire::WireError::Replay) => {
+                    auth_drops += 1;
+                    continue;
+                }
+                Err(_) => continue,
             };
             if hdr.channel != Channel::Output {
                 continue;
@@ -241,9 +290,6 @@ mod linux {
             }
             last_seq = Some(hdr.sequence);
 
-            if wire::decode_output(&buf[HEADER_LEN..], &mut feature_buf[1..]).is_err() {
-                continue;
-            }
             // Report-id placeholder. Already zero from the array literal,
             // but reset explicitly so a future code change can't corrupt it.
             feature_buf[0] = 0;
@@ -269,7 +315,8 @@ mod linux {
                 last_log = Instant::now();
                 eprintln!(
                     "\noutput: recv={received} applied={applied} ooo={out_of_order} \
-                     hiderr={hidraw_errors} last_msg_id=0x{:02x}",
+                     auth_drops={auth_drops} hiderr={hidraw_errors} \
+                     last_msg_id=0x{:02x}",
                     feature_buf[1],
                 );
             }
@@ -359,17 +406,17 @@ mod linux {
         target: SocketAddr,
         state: &ControllerState,
         sequence: u32,
+        auth_key: Option<&AuthKey>,
         wire_buf: &mut [u8; INPUT_PACKET_LEN],
         stats: &mut Stats,
     ) {
         let hdr = Header {
             channel: Channel::Input,
+            flags: 0,
             sequence,
             timestamp_us: now_us_low32(),
         };
-        if wire::encode_header(&hdr, &mut wire_buf[..HEADER_LEN]).is_err()
-            || wire::encode_input(state, &mut wire_buf[HEADER_LEN..]).is_err()
-        {
+        if wire::encode_input_packet(&hdr, state, auth_key, wire_buf).is_err() {
             stats.send_errors += 1;
             return;
         }

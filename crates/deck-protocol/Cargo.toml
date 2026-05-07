@@ -7,6 +7,8 @@ description = "Steam Deck controller HID layout, canonical state, and network wi
 
 [dependencies]
 bitflags = "2"
+hmac = { version = "0.12", default-features = false }
+sha2 = { version = "0.10", default-features = false }
 
 [lints]
 workspace = true

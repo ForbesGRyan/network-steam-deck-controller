@@ -5,13 +5,15 @@ Windows PC, where they appear as a virtual Steam Deck controller. Steam Input
 on Windows handles all gameplay-side mapping (gyro, trackpads, back paddles,
 per-game profiles).
 
-> **Status:** early-stage scaffold. Rust crates compile and pass 13 unit
+> **Status:** working scaffold. Rust crates compile and pass 30 unit
 > tests. The Deck → hidraw → wire pipeline has been validated on real
-> hardware (`BUTTON_MAP` confirmed for everything the kernel driver
-> exposes). The Windows kernel driver carries real Steam Deck USB +
-> HID descriptors but its UDE bring-up bodies are still stubbed pending
-> WDK install. See [ARCHITECTURE.md](ARCHITECTURE.md) for the full
-> design and remaining validations.
+> hardware. The Windows kernel driver enumerates as a real Steam Deck
+> Controller, Steam Input loads its `controller_neptune` config, and live
+> HID frames + rumble flow through. End-to-end network validation is
+> still gated on a Hyper-V external-vSwitch UDP-drop issue we have not
+> yet bypassed (USB ethernet adapter or bare-metal pivot). See
+> [ARCHITECTURE.md](ARCHITECTURE.md) for the full design and remaining
+> validations.
 
 ## Why
 
@@ -64,33 +66,96 @@ setup.
 
 ## Run
 
-End-to-end use requires real hardware and an installed driver, neither of
-which exists yet. What works today:
-
-**Validate the protocol crate:**
+### Build
 
 ```sh
-cargo test -p deck-protocol
+cargo build --workspace --release
+cargo test --workspace
 ```
 
-**Run the wire layer without a driver** (the Windows side will warn that
-the driver isn't available and fall back to listen-only mode, which still
-exercises the full UDP-decode and HID-encode pipeline):
+### Windows side (PC running games)
 
-Windows PC (PowerShell):
-```powershell
-.\target\release\client-win.exe 49152
-```
+1. **Build and install the kernel driver.** The driver is *not* part of
+   the Cargo workspace; it needs Visual Studio + the WDK. See
+   [driver/README.md](driver/README.md). After building:
 
-Steam Deck (after the hidraw spike — see
-[ARCHITECTURE.md#pending-validations](ARCHITECTURE.md#pending-validations)):
+   ```powershell
+   # Elevated PowerShell.
+   bcdedit /set testsigning on   # one-time, until you have an EV cert
+   # Reboot, then:
+   pwsh -ExecutionPolicy Bypass -File driver\scripts\install.ps1
+   ```
+
+   `install.ps1` wraps `pnputil /add-driver` plus the
+   `devcon install root\NetworkDeckController` call needed to instantiate
+   the root-enumerated PnP node. Uninstall via `driver\scripts\uninstall.ps1`.
+
+2. **Run the user-mode service.** Listens on UDP 49152 by default, attaches
+   to the kernel driver, parks an output IOCTL for rumble feedback. If the
+   driver isn't installed yet, runs in listen-only mode and reattaches the
+   moment it appears (`DriverHolder` retries every 5 s).
+
+   ```powershell
+   .\target\release\client-win.exe 49152
+   # or with HMAC packet auth:
+   $env:NETWORK_DECK_KEY = "<64 hex chars>"
+   .\target\release\client-win.exe 49152
+   ```
+
+   Useful test modes:
+   - `client-win.exe --test` synthesizes alternating-A-button reports at
+     ~250 Hz so Steam's Controller Layout test screen can verify the
+     virtual device works without a Deck attached.
+   - `client-win.exe --replay <hidraw-capture.bin>` replays a captured
+     hidraw stream from a real Deck (`cat /dev/hidrawN > foo.bin` on the
+     Deck) at full cadence.
+
+### Deck side (Linux)
+
 ```sh
-sudo ./target/release/server-deck /dev/hidrawN <windows-ip>:49152
+# One-time: udev rule so the deck user can read hidraw without sudo.
+sudo cp crates/server-deck/scripts/70-steam-deck.rules /etc/udev/rules.d/
+sudo udevadm control --reload && sudo udevadm trigger
+
+# Run server. Match port to client-win's listen port.
+./target/release/server-deck /dev/hidrawN <windows-ip>:49152
 ```
 
-Both ends print live-updating stats; on Windows you'll see packet counts
-climbing and decoded controller state mirroring whatever's happening on
-the Deck.
+For unattended setups, install the systemd unit:
+
+```sh
+sudo cp crates/server-deck/scripts/network-deck-server.service /etc/systemd/system/
+# Edit the Environment= lines for your hidraw path + Windows IP, then:
+sudo systemctl daemon-reload
+sudo systemctl enable --now network-deck-server.service
+```
+
+To enable HMAC packet auth, write the same hex key on both ends:
+
+```sh
+echo 'NETWORK_DECK_KEY=<64 hex chars>' | sudo tee /etc/network-deck.env
+sudo systemctl restart network-deck-server.service
+```
+
+### What you'll see
+
+Both binaries print live stats. Steam's Controller Layout test screen
+mirrors button presses and stick / trackpad state with single-frame
+latency over a clean Wi-Fi link.
+
+To find the right hidraw node on the Deck:
+```sh
+for f in /sys/class/hidraw/hidraw*/device/uevent; do
+    grep -l "HID_ID=0003:000028DE:00001205" "$f" \
+        && echo "  -> ${f%/device/uevent}"
+done
+```
+
+While Steam owns the controller in `hid-steam` mode, hidraw won't see
+gamepad-state frames. To get raw frames, kill Steam and unbind hid-steam:
+```sh
+echo -n "<phys-id>" | sudo tee /sys/bus/hid/drivers/hid-steam/unbind
+```
 
 ## What's left
 
@@ -109,7 +174,10 @@ Tracked in detail in [ARCHITECTURE.md](ARCHITECTURE.md#build-sequence):
    transitions show in Steam Controller Layout)
 7. Output channel: rumble/haptics back to Deck. — done (path wired;
    end-to-end validation pending network and a Deck running `server-deck`)
-8. Polish: reconnect, pairing, packaging.
+8. Polish: reconnect, pairing, packaging. — done
+   (driver/hidraw reopen on transient failure, optional HMAC-SHA256
+   per-packet auth + 30 s replay window via `NETWORK_DECK_KEY`,
+   PowerShell install scripts, systemd unit + udev rule)
 
 ## License
 

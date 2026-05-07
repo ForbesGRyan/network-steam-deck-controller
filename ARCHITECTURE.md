@@ -162,7 +162,21 @@ Signing path:
    with `O_RDWR` on the hidraw node, and (b) the network drop on the
    Hyper-V external vSwitch resolved or the VM swapped for bare-metal
    Windows.*
-8. Polish: reconnect, pairing, packaging.
+8. ✅ Polish: reconnect, pairing, packaging.
+   *Reconnect: `DriverHolder` on Windows reopens the kernel handle on
+   transient failure with 5 s backoff so listen / test / replay modes
+   survive driver reloads. `wait_for_hidraw` on the Deck does the
+   equivalent for `/dev/hidrawN`. Pairing: optional HMAC-SHA256 with
+   16-byte truncated tag covering the full packet (header + body),
+   wire `VERSION` bumped 1→2 to lock out plaintext-only peers when a key
+   is configured. `FLAG_AUTHENTICATED` in the header keeps mismatched
+   configurations from silently downgrading to plaintext. Replay window
+   is wrap-aware ±30 s on the low-32-bit microsecond timestamp.
+   Key loaded from `NETWORK_DECK_KEY` env (64 hex chars) on both sides.
+   Packaging: `driver/scripts/install.ps1` + `uninstall.ps1` wrap
+   `pnputil` and `devcon`. `crates/server-deck/scripts/`
+   ships a systemd unit and a udev rule. Release-profile is `lto = "thin"`
+   + `codegen-units = 1` for a small / fast binary.*
 
 ## Pending validations
 

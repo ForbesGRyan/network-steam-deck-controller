@@ -1,6 +1,7 @@
 //! Network wire format between the Deck server and the Windows client.
 //!
-//! Two channels share a 16-byte header. Bodies are channel-specific. All
+//! Two channels share a 16-byte header followed by a channel-specific body
+//! and a 16-byte truncated HMAC-SHA256 tag (see [`crate::auth`]). All
 //! multi-byte integers are little-endian.
 //!
 //! Header layout (16 bytes):
@@ -9,7 +10,7 @@
 //!  0..4   magic            "NUSB"
 //!  4      version          [`VERSION`]
 //!  5      channel          [`Channel`]
-//!  6..8   flags            reserved, must be zero
+//!  6..8   flags            u16 — bit 0 = AUTHENTICATED (tag is real HMAC)
 //!  8..12  sequence         u32, monotonically increasing per channel
 //! 12..16  timestamp_us     u32, low 32 bits of sender wall-clock µs
 //! ```
@@ -44,14 +45,15 @@
 //! hidraw interface speaks the same dialect, so the body is written
 //! through unchanged on the Deck side.
 
+use crate::auth::{self, AuthKey, FLAG_AUTHENTICATED, TAG_LEN};
 use crate::buttons::Buttons;
 use crate::state::{ControllerState, Stick, Trackpad, Vec3i};
 
 /// Magic bytes at the start of every packet. Catches misrouted traffic.
 pub const MAGIC: [u8; 4] = *b"NUSB";
 
-/// Wire-format version. Bump on incompatible changes.
-pub const VERSION: u8 = 1;
+/// Wire-format version. Bumped to 2 when the per-packet HMAC tag was added.
+pub const VERSION: u8 = 2;
 
 /// Bytes in the shared packet header.
 pub const HEADER_LEN: usize = 16;
@@ -63,11 +65,11 @@ pub const INPUT_BODY_LEN: usize = 44;
 /// report — the same 64 bytes Steam writes via `SET_REPORT(FEATURE)`.
 pub const OUTPUT_BODY_LEN: usize = 64;
 
-/// Total bytes on the wire for an input packet.
-pub const INPUT_PACKET_LEN: usize = HEADER_LEN + INPUT_BODY_LEN;
+/// Total bytes on the wire for an input packet (header + body + auth tag).
+pub const INPUT_PACKET_LEN: usize = HEADER_LEN + INPUT_BODY_LEN + TAG_LEN;
 
-/// Total bytes on the wire for an output packet.
-pub const OUTPUT_PACKET_LEN: usize = HEADER_LEN + OUTPUT_BODY_LEN;
+/// Total bytes on the wire for an output packet (header + body + auth tag).
+pub const OUTPUT_PACKET_LEN: usize = HEADER_LEN + OUTPUT_BODY_LEN + TAG_LEN;
 
 /// Logical channel a packet belongs to.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -95,6 +97,9 @@ impl Channel {
 pub struct Header {
     /// Which channel this packet belongs to.
     pub channel: Channel,
+    /// Bitfield. Bit 0 ([`FLAG_AUTHENTICATED`]) is set by senders that
+    /// computed a real HMAC tag for this packet.
+    pub flags: u16,
     /// Per-channel monotonic sequence number.
     pub sequence: u32,
     /// Sender timestamp, low 32 bits of microseconds.
@@ -117,6 +122,11 @@ pub enum WireError {
     BadVersion(u8),
     /// Channel byte did not map to a known [`Channel`].
     BadChannel(u8),
+    /// Receiver had a key but the packet's HMAC tag didn't validate, or
+    /// the sender claimed `FLAG_AUTHENTICATED` but no key was configured.
+    AuthFailed,
+    /// Packet's `timestamp_us` falls outside the configured replay window.
+    Replay,
 }
 
 #[inline]
@@ -157,7 +167,7 @@ pub fn encode_header(hdr: &Header, out: &mut [u8]) -> Result<(), WireError> {
     out[0..4].copy_from_slice(&MAGIC);
     out[4] = VERSION;
     out[5] = hdr.channel as u8;
-    out[6..8].copy_from_slice(&[0, 0]); // flags reserved
+    out[6..8].copy_from_slice(&hdr.flags.to_le_bytes());
     out[8..12].copy_from_slice(&hdr.sequence.to_le_bytes());
     out[12..16].copy_from_slice(&hdr.timestamp_us.to_le_bytes());
     Ok(())
@@ -183,10 +193,12 @@ pub fn decode_header(buf: &[u8]) -> Result<Header, WireError> {
         return Err(WireError::BadVersion(buf[4]));
     }
     let channel = Channel::from_u8(buf[5]).ok_or(WireError::BadChannel(buf[5]))?;
+    let flags = u16::from_le_bytes([buf[6], buf[7]]);
     let sequence = u32::from_le_bytes([buf[8], buf[9], buf[10], buf[11]]);
     let timestamp_us = u32::from_le_bytes([buf[12], buf[13], buf[14], buf[15]]);
     Ok(Header {
         channel,
+        flags,
         sequence,
         timestamp_us,
     })
@@ -320,6 +332,188 @@ pub fn decode_output(buf: &[u8], out: &mut [u8]) -> Result<(), WireError> {
     Ok(())
 }
 
+// ---------------------------------------------------------------------------
+// Packet-level helpers: header + body + tag in one shot.
+//
+// The primitive `encode_header` / `encode_input` / `encode_output` calls are
+// still available for callers that want to assemble packets piece-meal, but
+// the helpers here are the recommended path. They handle the tag and the
+// FLAG_AUTHENTICATED bit so the auth contract stays a property of the wire
+// layer instead of leaking into every send / recv site.
+// ---------------------------------------------------------------------------
+
+/// Encode an INPUT packet into `out`.
+///
+/// `out` must be at least [`INPUT_PACKET_LEN`] bytes. If `key` is `Some`,
+/// the trailing 16 bytes get the HMAC tag and `FLAG_AUTHENTICATED` is set
+/// in the header. If `None`, the trailing 16 bytes are zeroed and the flag
+/// is left clear — that's the dev-mode (no key) plaintext format.
+///
+/// # Errors
+/// [`WireError::Short`] if `out.len() < INPUT_PACKET_LEN`.
+pub fn encode_input_packet(
+    hdr: &Header,
+    state: &ControllerState,
+    key: Option<&AuthKey>,
+    out: &mut [u8],
+) -> Result<(), WireError> {
+    if out.len() < INPUT_PACKET_LEN {
+        return Err(WireError::Short {
+            got: out.len(),
+            want: INPUT_PACKET_LEN,
+        });
+    }
+    let mut hdr = *hdr;
+    hdr.flags = if key.is_some() {
+        hdr.flags | FLAG_AUTHENTICATED
+    } else {
+        hdr.flags & !FLAG_AUTHENTICATED
+    };
+    encode_header(&hdr, &mut out[..HEADER_LEN])?;
+    encode_input(state, &mut out[HEADER_LEN..HEADER_LEN + INPUT_BODY_LEN])?;
+    apply_tag(key, &mut out[..INPUT_PACKET_LEN]);
+    Ok(())
+}
+
+/// Decode and authenticate an INPUT packet.
+///
+/// Returns the parsed header and body. If `key` is `Some`, the packet's tag
+/// is verified and the timestamp is checked against the replay window. If
+/// `key` is `None`, packets advertising `FLAG_AUTHENTICATED` are still
+/// rejected (they were meant for a configured peer); plaintext packets pass.
+///
+/// # Errors
+/// All [`WireError`] variants. Common ones:
+/// - [`WireError::AuthFailed`] if the tag is wrong, missing, or the flag bit
+///   contradicts the configuration.
+/// - [`WireError::Replay`] if `now_us` and the packet's timestamp diverge by
+///   more than `replay_window_us`.
+pub fn decode_input_packet(
+    buf: &[u8],
+    key: Option<&AuthKey>,
+    now_us: u32,
+    replay_window_us: u32,
+) -> Result<(Header, ControllerState), WireError> {
+    if buf.len() < INPUT_PACKET_LEN {
+        return Err(WireError::Short {
+            got: buf.len(),
+            want: INPUT_PACKET_LEN,
+        });
+    }
+    let hdr = decode_header(&buf[..HEADER_LEN])?;
+    verify_packet(&hdr, key, &buf[..INPUT_PACKET_LEN], now_us, replay_window_us)?;
+    let state = decode_input(&buf[HEADER_LEN..HEADER_LEN + INPUT_BODY_LEN])?;
+    Ok((hdr, state))
+}
+
+/// Encode an OUTPUT packet (header + 64-byte feature report + tag) into `out`.
+///
+/// # Errors
+/// [`WireError::Short`] if either buffer is too small.
+pub fn encode_output_packet(
+    hdr: &Header,
+    report: &[u8],
+    key: Option<&AuthKey>,
+    out: &mut [u8],
+) -> Result<(), WireError> {
+    if out.len() < OUTPUT_PACKET_LEN {
+        return Err(WireError::Short {
+            got: out.len(),
+            want: OUTPUT_PACKET_LEN,
+        });
+    }
+    let mut hdr = *hdr;
+    hdr.flags = if key.is_some() {
+        hdr.flags | FLAG_AUTHENTICATED
+    } else {
+        hdr.flags & !FLAG_AUTHENTICATED
+    };
+    encode_header(&hdr, &mut out[..HEADER_LEN])?;
+    encode_output(report, &mut out[HEADER_LEN..HEADER_LEN + OUTPUT_BODY_LEN])?;
+    apply_tag(key, &mut out[..OUTPUT_PACKET_LEN]);
+    Ok(())
+}
+
+/// Decode and authenticate an OUTPUT packet, copying the 64-byte feature
+/// report payload into `report_out`.
+///
+/// # Errors
+/// See [`decode_input_packet`] — same set.
+pub fn decode_output_packet(
+    buf: &[u8],
+    key: Option<&AuthKey>,
+    now_us: u32,
+    replay_window_us: u32,
+    report_out: &mut [u8],
+) -> Result<Header, WireError> {
+    if buf.len() < OUTPUT_PACKET_LEN {
+        return Err(WireError::Short {
+            got: buf.len(),
+            want: OUTPUT_PACKET_LEN,
+        });
+    }
+    let hdr = decode_header(&buf[..HEADER_LEN])?;
+    verify_packet(&hdr, key, &buf[..OUTPUT_PACKET_LEN], now_us, replay_window_us)?;
+    decode_output(
+        &buf[HEADER_LEN..HEADER_LEN + OUTPUT_BODY_LEN],
+        report_out,
+    )?;
+    Ok(hdr)
+}
+
+/// Compute and write the trailing HMAC tag for `packet`. With `key = None`,
+/// zeros the tag bytes — receivers will reject this packet if they were
+/// configured with a key (because `FLAG_AUTHENTICATED` is also clear, set
+/// by the encode helpers above).
+fn apply_tag(key: Option<&AuthKey>, packet: &mut [u8]) {
+    let len = packet.len();
+    let body_end = len - TAG_LEN;
+    match key {
+        Some(k) => {
+            let tag = auth::compute_tag(k, &packet[..body_end]);
+            packet[body_end..].copy_from_slice(&tag);
+        }
+        None => {
+            for byte in &mut packet[body_end..] {
+                *byte = 0;
+            }
+        }
+    }
+}
+
+/// Validate the auth + replay properties of a fully-buffered packet.
+///
+/// Plaintext (no key on either side) is allowed and skipped. Mixed
+/// configurations (one side has a key, the other doesn't) are rejected so
+/// that operators can't accidentally run with auth on one end only.
+fn verify_packet(
+    hdr: &Header,
+    key: Option<&AuthKey>,
+    packet: &[u8],
+    now_us: u32,
+    replay_window_us: u32,
+) -> Result<(), WireError> {
+    let len = packet.len();
+    let body_end = len - TAG_LEN;
+    let claims_auth = (hdr.flags & FLAG_AUTHENTICATED) != 0;
+
+    match (key, claims_auth) {
+        (Some(k), true) => {
+            if !auth::verify_tag(k, &packet[..body_end], &packet[body_end..]) {
+                return Err(WireError::AuthFailed);
+            }
+            if !auth::is_within_replay_window(hdr.timestamp_us, now_us, replay_window_us) {
+                return Err(WireError::Replay);
+            }
+            Ok(())
+        }
+        (None, false) => Ok(()), // dev-mode plaintext on both sides
+        // Mismatched: receiver expects auth and sender didn't sign, or
+        // receiver doesn't have a key and sender claims auth.
+        _ => Err(WireError::AuthFailed),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -350,6 +544,7 @@ mod tests {
     fn header_roundtrip() {
         let hdr = Header {
             channel: Channel::Input,
+            flags: FLAG_AUTHENTICATED,
             sequence: 42,
             timestamp_us: 0xDEAD_BEEF,
         };
@@ -423,5 +618,123 @@ mod tests {
             decode_output(&buf, &mut out),
             Err(WireError::Short { .. })
         ));
+    }
+
+    fn test_key() -> AuthKey {
+        AuthKey::from_hex(
+            "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff",
+        )
+        .unwrap()
+    }
+
+    fn header(channel: Channel) -> Header {
+        Header {
+            channel,
+            flags: 0,
+            sequence: 7,
+            timestamp_us: 1_234_567,
+        }
+    }
+
+    #[test]
+    fn input_packet_roundtrip_with_auth() {
+        let key = test_key();
+        let hdr = header(Channel::Input);
+        let state = sample_state();
+        let mut packet = [0_u8; INPUT_PACKET_LEN];
+        encode_input_packet(&hdr, &state, Some(&key), &mut packet).unwrap();
+        let (decoded_hdr, decoded_state) =
+            decode_input_packet(&packet, Some(&key), hdr.timestamp_us, 30_000_000).unwrap();
+        assert_eq!(decoded_hdr.flags & FLAG_AUTHENTICATED, FLAG_AUTHENTICATED);
+        assert_eq!(decoded_hdr.sequence, hdr.sequence);
+        assert_eq!(decoded_state, state);
+    }
+
+    #[test]
+    fn input_packet_roundtrip_plaintext() {
+        let hdr = header(Channel::Input);
+        let state = sample_state();
+        let mut packet = [0_u8; INPUT_PACKET_LEN];
+        encode_input_packet(&hdr, &state, None, &mut packet).unwrap();
+        // Plaintext — flag clear, tag bytes zero.
+        assert_eq!(packet[6], 0);
+        for &b in &packet[INPUT_PACKET_LEN - 16..] {
+            assert_eq!(b, 0);
+        }
+        let (_, decoded_state) =
+            decode_input_packet(&packet, None, hdr.timestamp_us, 30_000_000).unwrap();
+        assert_eq!(decoded_state, state);
+    }
+
+    #[test]
+    fn input_packet_rejects_bad_tag() {
+        let key = test_key();
+        let hdr = header(Channel::Input);
+        let state = sample_state();
+        let mut packet = [0_u8; INPUT_PACKET_LEN];
+        encode_input_packet(&hdr, &state, Some(&key), &mut packet).unwrap();
+        packet[INPUT_PACKET_LEN - 1] ^= 0xFF;
+        assert!(matches!(
+            decode_input_packet(&packet, Some(&key), hdr.timestamp_us, 30_000_000),
+            Err(WireError::AuthFailed)
+        ));
+    }
+
+    #[test]
+    fn input_packet_rejects_mixed_config() {
+        let key = test_key();
+        let hdr = header(Channel::Input);
+        let state = sample_state();
+        // Sender has key, receiver doesn't.
+        let mut packet = [0_u8; INPUT_PACKET_LEN];
+        encode_input_packet(&hdr, &state, Some(&key), &mut packet).unwrap();
+        assert!(matches!(
+            decode_input_packet(&packet, None, hdr.timestamp_us, 30_000_000),
+            Err(WireError::AuthFailed)
+        ));
+        // Sender no key, receiver has key.
+        let mut packet = [0_u8; INPUT_PACKET_LEN];
+        encode_input_packet(&hdr, &state, None, &mut packet).unwrap();
+        assert!(matches!(
+            decode_input_packet(&packet, Some(&key), hdr.timestamp_us, 30_000_000),
+            Err(WireError::AuthFailed)
+        ));
+    }
+
+    #[test]
+    fn input_packet_rejects_replay() {
+        let key = test_key();
+        let hdr = header(Channel::Input);
+        let state = sample_state();
+        let mut packet = [0_u8; INPUT_PACKET_LEN];
+        encode_input_packet(&hdr, &state, Some(&key), &mut packet).unwrap();
+        // Receiver clock 2 minutes ahead of packet.
+        let future = hdr.timestamp_us.wrapping_add(120_000_000);
+        assert!(matches!(
+            decode_input_packet(&packet, Some(&key), future, 30_000_000),
+            Err(WireError::Replay)
+        ));
+    }
+
+    #[test]
+    fn output_packet_roundtrip() {
+        let key = test_key();
+        let hdr = header(Channel::Output);
+        let mut report = [0_u8; OUTPUT_BODY_LEN];
+        report[0] = 0xEB;
+        report[1] = 4;
+        let mut packet = [0_u8; OUTPUT_PACKET_LEN];
+        encode_output_packet(&hdr, &report, Some(&key), &mut packet).unwrap();
+        let mut decoded = [0_u8; OUTPUT_BODY_LEN];
+        let decoded_hdr = decode_output_packet(
+            &packet,
+            Some(&key),
+            hdr.timestamp_us,
+            30_000_000,
+            &mut decoded,
+        )
+        .unwrap();
+        assert_eq!(decoded_hdr.channel, Channel::Output);
+        assert_eq!(decoded, report);
     }
 }

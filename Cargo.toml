@@ -14,3 +14,12 @@ unsafe_op_in_unsafe_fn = "warn"
 pedantic = { level = "warn", priority = -1 }
 module_name_repetitions = "allow"
 similar_names = "allow"
+
+# Release profile tuned for the user-mode binaries — both are real-time-ish
+# (250 Hz input loop, 250 Hz rumble loop) and ship a single artifact each.
+# LTO + codegen-units=1 trades build time for a smaller, faster binary; the
+# servers run the same release artifact for hours, so the trade is worth it.
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = "debuginfo"
