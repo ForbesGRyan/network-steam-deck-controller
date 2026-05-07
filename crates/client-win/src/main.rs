@@ -162,6 +162,7 @@ fn main() {
             trusted.clone(),
             SocketAddr::new(Ipv4Addr::BROADCAST.into(), DEFAULT_PORT),
             hostname(),
+            DEFAULT_PORT,
         )
         .unwrap_or_else(|e| {
             eprintln!("beacon init: {e:?}");
@@ -231,7 +232,7 @@ fn main() {
         stats.packets += 1;
         if last_print.elapsed() >= PRINT_EVERY {
             last_print = Instant::now();
-            print_status(&mut stdout, &stats, &hdr, &state);
+            print_status(&mut stdout, &stats, &hdr, &state, beacon.current_peer_with_age());
         }
     }
 }
@@ -351,10 +352,23 @@ fn parse_packet(
     Some((hdr, state))
 }
 
-fn print_status<W: Write>(out: &mut W, stats: &Stats, hdr: &Header, state: &ControllerState) {
+fn print_status<W: Write>(
+    out: &mut W,
+    stats: &Stats,
+    hdr: &Header,
+    state: &ControllerState,
+    peer: Option<(SocketAddr, Duration)>,
+) {
+    let peer_str = match peer {
+        None => "peer: searching".to_owned(),
+        Some((a, age)) if age > discovery::beacon::STALE_AFTER => {
+            format!("peer: {a} age {:.1}s STALE", age.as_secs_f64())
+        }
+        Some((a, age)) => format!("peer: {a} age {:.1}s", age.as_secs_f64()),
+    };
     let _ = write!(
         out,
-        "\x1b[2K\rpkts={:>7} drop={:>5} err={:>4} push={:>7} perr={:>4} \
+        "\x1b[2K\r{peer_str} pkts={:>7} drop={:>5} err={:>4} push={:>7} perr={:>4} \
          seq_hdr={:>10} \
          L({:>+6},{:>+6}) R({:>+6},{:>+6}) \
          LT={:>5} RT={:>5} \

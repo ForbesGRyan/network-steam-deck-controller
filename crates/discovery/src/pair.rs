@@ -2,6 +2,7 @@
 //! signed PAIRING beacons, prompts the user on first valid sighting, then
 //! exchanges ACCEPT beacons until both sides confirm.
 
+use std::collections::HashSet;
 use std::io::{self, BufRead, Read, Write};
 use std::net::{SocketAddr, UdpSocket};
 use std::path::PathBuf;
@@ -50,6 +51,7 @@ pub fn run_pair<R: Read, W: Write>(
     let deadline = Instant::now() + cfg.timeout;
     let mut next_send = Instant::now();
     let mut buf = [0_u8; PACKET_LEN];
+    let mut declined: HashSet<[u8; crate::packet::PUBKEY_LEN]> = HashSet::new();
 
     // Phase 1+2: discover and prompt.
     let candidate = loop {
@@ -62,13 +64,18 @@ pub fn run_pair<R: Read, W: Write>(
             Ok((n, _src)) if n == PACKET_LEN => {
                 if let Ok(p) = packet::verify(&buf) {
                     if (p.flags & FLAG_PAIRING) != 0 && p.pubkey != cfg.identity.pubkey {
+                        // Skip repeat prompts for already-declined peers.
+                        if declined.contains(&p.pubkey) { continue; }
                         let fpr_str = fingerprint_str(&fingerprint(&p.pubkey));
                         let _ = writeln!(
                             log,
                             "found peer {name} fingerprint {fpr_str}",
                             name = p.name,
                         );
-                        if prompt_yes(stdin, log) { break p; }
+                        if prompt_yes(stdin, log) {
+                            break p;
+                        }
+                        declined.insert(p.pubkey);
                     }
                 }
             }

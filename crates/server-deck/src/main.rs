@@ -166,6 +166,7 @@ mod linux {
                 trusted.clone(),
                 SocketAddr::new(Ipv4Addr::BROADCAST.into(), OUTPUT_LISTEN_PORT),
                 hostname(),
+                OUTPUT_LISTEN_PORT,
             )
             .unwrap_or_else(|e| {
                 eprintln!("beacon init: {e:?}");

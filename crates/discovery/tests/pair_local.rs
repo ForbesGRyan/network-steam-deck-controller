@@ -96,3 +96,32 @@ fn one_side_declines_neither_writes_trust() {
     assert!(discovery::trust::load(dir_a.path()).unwrap().is_none());
     assert!(discovery::trust::load(dir_b.path()).unwrap().is_none());
 }
+
+#[test]
+fn timeout_with_no_peer_writes_no_trust() {
+    let dir_a = tempdir().unwrap();
+    let id_a = Arc::new(load_or_generate(dir_a.path()).unwrap());
+    let sock_a = UdpSocket::bind(ephemeral()).unwrap();
+    // Port 1 is reserved; no one is listening. On POSIX the send succeeds
+    // and recv times out; on Windows the OS may return an ICMP-unreachable
+    // error on recv_from. Either way no trust file should be written.
+    let nowhere: SocketAddr = "127.0.0.1:1".parse().unwrap();
+
+    let stdin_a = Cursor::new(b"y\n".to_vec());
+    let cfg_a = PairConfig {
+        identity: id_a,
+        recv_sock: sock_a,
+        unicast_target: nowhere,
+        self_name: "a".into(),
+        state_dir: dir_a.path().to_path_buf(),
+        timeout: Duration::from_secs(1),
+    };
+    let out = run_pair(&cfg_a, &mut stdin_a.clone(), &mut Vec::new());
+    // Accept Timeout OR IoError — either means no peer was found and no trust
+    // was committed. The difference is OS-level ICMP behaviour.
+    assert!(
+        matches!(out, PairOutcome::Timeout | PairOutcome::IoError(_)),
+        "expected Timeout or IoError, got {out:?}",
+    );
+    assert!(discovery::trust::load(dir_a.path()).unwrap().is_none());
+}

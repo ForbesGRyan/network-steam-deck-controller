@@ -37,6 +37,7 @@ pub struct Beacon {
     broadcast_dest: SocketAddr,
     session_key: [u8; SESSION_KEY_LEN],
     self_name: String,
+    listen_port: u16,
 }
 
 #[derive(Debug)]
@@ -54,6 +55,7 @@ impl Beacon {
         peer: Arc<TrustedPeer>,
         broadcast_dest: SocketAddr,
         self_name: String,
+        listen_port: u16,
     ) -> Result<Self, BeaconError> {
         let send_sock = UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0))?;
         send_sock.set_broadcast(true)?;
@@ -65,6 +67,7 @@ impl Beacon {
             broadcast_dest,
             session_key,
             self_name,
+            listen_port,
         })
     }
 
@@ -94,13 +97,21 @@ impl Beacon {
     pub fn handle_packet(&self, src: SocketAddr, bytes: &[u8]) {
         let Ok(decoded) = packet::verify(bytes) else { return };
         if decoded.pubkey != self.peer.pubkey { return; }
+        // Drop packets that name a specific peer other than us (fix #2: peer_fpr validation).
+        let my_fpr = fingerprint(&self.identity.pubkey);
+        let zero = [0_u8; FPR_LEN];
+        if decoded.peer_fpr != zero && decoded.peer_fpr != my_fpr { return; }
         #[allow(clippy::cast_possible_truncation)]
         let now32 = now_us() as u32;
         #[allow(clippy::cast_possible_truncation)]
         let pkt32 = decoded.timestamp_us as u32;
         if !deck_protocol::auth::is_within_replay_window(pkt32, now32, REPLAY_WINDOW_US) { return; }
+        // Normalize src to the data-plane listen port (fix #1: port mismatch).
+        // The sender's beacon comes from an ephemeral send socket; the actual
+        // data-plane port we must reach is self.listen_port.
+        let normalized = SocketAddr::new(src.ip(), self.listen_port);
         if let Ok(mut s) = self.state.lock() {
-            s.live = Some(LivePeer { addr: src, last_seen: Instant::now() });
+            s.live = Some(LivePeer { addr: normalized, last_seen: Instant::now() });
         }
     }
 
@@ -166,12 +177,12 @@ mod tests {
         let them = make_identity();
         let peer = make_peer(them.pubkey);
         let dest = "127.0.0.1:1".parse().unwrap();
-        let beacon = Beacon::new(me, peer.clone(), dest, "me".into()).unwrap();
+        let beacon = Beacon::new(me, peer.clone(), dest, "me".into(), 49152).unwrap();
 
         let pkt = BeaconPacket {
             flags: 0,
             pubkey: them.pubkey,
-            peer_fpr: [0; FPR_LEN],
+            peer_fpr: fingerprint(&beacon.identity.pubkey),
             timestamp_us: now_us(),
             name: "them".into(),
         };
@@ -180,7 +191,9 @@ mod tests {
         let src: SocketAddr = "192.168.1.42:55555".parse().unwrap();
         beacon.handle_packet(src, &buf);
 
-        assert_eq!(beacon.current_peer(), Some(src));
+        // Port must be normalized to the listen port, not the ephemeral src port.
+        let expected: SocketAddr = "192.168.1.42:49152".parse().unwrap();
+        assert_eq!(beacon.current_peer(), Some(expected));
     }
 
     #[test]
@@ -190,7 +203,7 @@ mod tests {
         let stranger = make_identity();
         let peer = make_peer(them.pubkey);
         let dest = "127.0.0.1:1".parse().unwrap();
-        let beacon = Beacon::new(me, peer, dest, "me".into()).unwrap();
+        let beacon = Beacon::new(me, peer, dest, "me".into(), 49152).unwrap();
 
         let pkt = BeaconPacket {
             flags: 0,
@@ -203,6 +216,49 @@ mod tests {
         packet::sign_into(&stranger.signing, &pkt, &mut buf).unwrap();
         beacon.handle_packet("1.2.3.4:5".parse().unwrap(), &buf);
 
+        assert_eq!(beacon.current_peer(), None);
+    }
+
+    #[test]
+    fn handle_packet_normalizes_to_listen_port() {
+        let me = make_identity();
+        let them = make_identity();
+        let peer = make_peer(them.pubkey);
+        let dest = "127.0.0.1:1".parse().unwrap();
+        let beacon = Beacon::new(me, peer.clone(), dest, "me".into(), 49152).unwrap();
+        let pkt = BeaconPacket {
+            flags: 0,
+            pubkey: them.pubkey,
+            peer_fpr: fingerprint(&beacon.identity.pubkey),
+            timestamp_us: now_us(),
+            name: "them".into(),
+        };
+        let mut buf = [0_u8; PACKET_LEN];
+        packet::sign_into(&them.signing, &pkt, &mut buf).unwrap();
+        beacon.handle_packet("192.168.1.42:55555".parse().unwrap(), &buf);
+        assert_eq!(beacon.current_peer().unwrap().port(), 49152);
+    }
+
+    #[test]
+    fn handle_packet_wrong_peer_fpr_dropped() {
+        let me = make_identity();
+        let them = make_identity();
+        let third = make_identity();
+        let peer = make_peer(them.pubkey);
+        let dest = "127.0.0.1:1".parse().unwrap();
+        let beacon = Beacon::new(me, peer.clone(), dest, "me".into(), 49152).unwrap();
+        // Beacon names the third party's fingerprint — must be dropped even
+        // though the packet is properly signed by the trusted peer.
+        let pkt = BeaconPacket {
+            flags: 0,
+            pubkey: them.pubkey,
+            peer_fpr: fingerprint(&third.pubkey),
+            timestamp_us: now_us(),
+            name: "them".into(),
+        };
+        let mut buf = [0_u8; PACKET_LEN];
+        packet::sign_into(&them.signing, &pkt, &mut buf).unwrap();
+        beacon.handle_packet("192.168.1.42:55555".parse().unwrap(), &buf);
         assert_eq!(beacon.current_peer(), None);
     }
 }
