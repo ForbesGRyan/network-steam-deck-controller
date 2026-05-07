@@ -1,0 +1,22 @@
+[package]
+name = "discovery"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+description = "LAN discovery + first-time pairing for the Deck-to-Windows controller bridge"
+
+[dependencies]
+deck-protocol = { path = "../deck-protocol" }
+ed25519-dalek = { version = "2", default-features = false, features = ["std", "rand_core", "fast"] }
+hkdf = "0.12"
+sha2 = "0.10"
+rand_core = { version = "0.6", features = ["std"] }
+serde = { version = "1", features = ["derive"] }
+toml = "0.8"
+base64 = "0.22"
+
+[dev-dependencies]
+tempfile = "3"
+
+[lints]
+workspace = true
