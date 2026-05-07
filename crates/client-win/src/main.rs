@@ -88,7 +88,7 @@ fn main() {
     let latest_src: Arc<Mutex<Option<SocketAddr>>> = Arc::new(Mutex::new(None));
 
     #[cfg(windows)]
-    let driver = open_driver_with_pend_thread(&sock, &latest_src);
+    let driver = spawn_driver_with_pend_thread(&sock, &latest_src);
     #[cfg(not(windows))]
     eprintln!("driver IPC: requires Windows; running listen-only");
 
@@ -117,11 +117,9 @@ fn main() {
         }
 
         #[cfg(windows)]
-        if let Some(d) = driver.as_ref() {
-            match d.push_input(&hid_buf) {
-                Ok(()) => stats.pushed += 1,
-                Err(_) => stats.push_errors += 1,
-            }
+        match driver.push_input(&hid_buf) {
+            Ok(()) => stats.pushed += 1,
+            Err(_) => stats.push_errors += 1,
         }
 
         stats.packets += 1;
@@ -276,39 +274,30 @@ fn print_status<W: Write>(out: &mut W, stats: &Stats, hdr: &Header, state: &Cont
 }
 
 #[cfg(windows)]
-fn open_driver_with_pend_thread(
+fn spawn_driver_with_pend_thread(
     sock: &UdpSocket,
     latest_src: &Arc<Mutex<Option<SocketAddr>>>,
-) -> Option<Arc<driver::DeckDriver>> {
-    match driver::DeckDriver::open() {
-        Ok(d) => {
-            eprintln!("driver: opened");
-            let arc = Arc::new(d);
-            let pend_handle = arc.clone();
-            // Clone the bound socket so the output thread can send_to the
-            // Deck on the same port we listen on. Replies come back via the
-            // OS source-address; we infer the Deck's listen port from the
-            // wire-protocol convention (DEFAULT_PORT) rather than echoing to
-            // src.port — the Deck's outgoing source port is ephemeral.
-            let send_sock = match sock.try_clone() {
-                Ok(s) => s,
-                Err(e) => {
-                    eprintln!("socket clone for output thread: {e}");
-                    return Some(arc);
-                }
-            };
-            let src_handle = latest_src.clone();
-            std::thread::Builder::new()
-                .name("deck-pend-output".into())
-                .spawn(move || pend_output_loop(&pend_handle, &send_sock, &src_handle))
-                .ok();
-            Some(arc)
-        }
+) -> Arc<driver::DriverHolder> {
+    let holder = Arc::new(driver::DriverHolder::try_init());
+    let pend_handle = holder.clone();
+    // Clone the bound socket so the output thread can send_to the Deck on
+    // the same port we listen on. Replies come back via the OS source
+    // address; we infer the Deck's listen port from the wire-protocol
+    // convention (DEFAULT_PORT) rather than echoing to src.port — the
+    // Deck's outgoing source port is ephemeral.
+    let send_sock = match sock.try_clone() {
+        Ok(s) => s,
         Err(e) => {
-            eprintln!("driver: not available ({e}); running listen-only");
-            None
+            eprintln!("socket clone for output thread: {e}");
+            return holder;
         }
-    }
+    };
+    let src_handle = latest_src.clone();
+    std::thread::Builder::new()
+        .name("deck-pend-output".into())
+        .spawn(move || pend_output_loop(&pend_handle, &send_sock, &src_handle))
+        .ok();
+    holder
 }
 
 /// Drive the kernel-side IOCTL with a synthetic input pattern so the full
@@ -316,14 +305,11 @@ fn open_driver_with_pend_thread(
 /// `A` button each second; everything else stays at idle.
 #[cfg(windows)]
 fn run_test_mode() {
-    let driver = match driver::DeckDriver::open() {
-        Ok(d) => d,
-        Err(e) => {
-            eprintln!("driver: not available ({e}); test mode requires the driver");
-            std::process::exit(1);
-        }
-    };
-    eprintln!("driver: opened (test mode — synthesizing input @ ~250 Hz)");
+    let driver = driver::DriverHolder::try_init();
+    if !driver.is_open() {
+        eprintln!("test mode will keep retrying open every 5 s; install the driver to begin");
+    }
+    eprintln!("driver: test mode — synthesizing input @ ~250 Hz");
 
     let mut state = ControllerState::default();
     let mut hid_buf = [0_u8; driver::INPUT_REPORT_SIZE];
@@ -385,14 +371,11 @@ fn run_test_mode() {
 /// makes a long-lived test session.
 #[cfg(windows)]
 fn run_replay_mode(path: &str) {
-    let driver = match driver::DeckDriver::open() {
-        Ok(d) => d,
-        Err(e) => {
-            eprintln!("driver: not available ({e}); replay mode requires the driver");
-            std::process::exit(1);
-        }
-    };
-    eprintln!("driver: opened (replay mode — {path} @ ~250 Hz, looping)");
+    let driver = driver::DriverHolder::try_init();
+    if !driver.is_open() {
+        eprintln!("replay mode will keep retrying open every 5 s; install the driver to begin");
+    }
+    eprintln!("driver: replay mode — {path} @ ~250 Hz, looping");
 
     let raw = match std::fs::read(path) {
         Ok(b) => b,
@@ -476,7 +459,7 @@ fn run_replay_mode(_path: &str) {
 /// rumble frame is imperceptible at Steam's ~250 Hz cadence.
 #[cfg(windows)]
 fn pend_output_loop(
-    driver: &driver::DeckDriver,
+    driver: &driver::DriverHolder,
     send_sock: &UdpSocket,
     latest_src: &Arc<Mutex<Option<SocketAddr>>>,
 ) {

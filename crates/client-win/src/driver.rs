@@ -15,6 +15,8 @@
 use std::io;
 use std::mem;
 use std::ptr;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use windows_sys::core::GUID;
 use windows_sys::Win32::Devices::DeviceAndDriverInstallation::{
@@ -231,6 +233,121 @@ impl Drop for DeckDriver {
         // elsewhere.
         unsafe {
             CloseHandle(self.handle);
+        }
+    }
+}
+
+/// Resilient wrapper around [`DeckDriver`] for callers that want a long-lived
+/// handle that survives driver reloads, hibernate transitions, and Steam
+/// restarts. Each call clones the inner `Arc` out from under the lock,
+/// invokes the I/O, and on `Err` invalidates the holder so the next call
+/// transparently re-opens. Open attempts back off to 5 s so a fully absent
+/// driver doesn't burn CPU on `SetupDiGetClassDevsW`.
+///
+/// `try_init` does not error on a missing driver — the holder starts empty
+/// and the first successful `current()` call lazily opens. Call sites can
+/// therefore always be running, even before `pnputil` has installed the .sys.
+pub struct DriverHolder {
+    inner: Mutex<Option<Arc<DeckDriver>>>,
+    last_open_attempt: Mutex<Option<Instant>>,
+}
+
+impl DriverHolder {
+    /// Construct a holder, attempting an initial open. The result of that
+    /// attempt is captured but never returned — the caller proceeds either
+    /// way. Logs the outcome so a misconfigured environment is visible.
+    #[must_use]
+    pub fn try_init() -> Self {
+        let inner = match DeckDriver::open() {
+            Ok(d) => {
+                eprintln!("driver: opened");
+                Some(Arc::new(d))
+            }
+            Err(e) => {
+                eprintln!("driver: not available ({e}); will retry on demand");
+                None
+            }
+        };
+        Self {
+            inner: Mutex::new(inner),
+            last_open_attempt: Mutex::new(Some(Instant::now())),
+        }
+    }
+
+    /// Open-on-demand backoff. Public so test code can plumb its own value.
+    const REOPEN_INTERVAL: Duration = Duration::from_secs(5);
+
+    /// Get the current `Arc<DeckDriver>`, attempting a re-open if absent
+    /// and the backoff window has elapsed.
+    fn current(&self) -> Option<Arc<DeckDriver>> {
+        // Fast path: handle is live.
+        if let Some(d) = self.inner.lock().ok().and_then(|g| g.clone()) {
+            return Some(d);
+        }
+        // Slow path: throttle re-open attempts.
+        let mut last = self.last_open_attempt.lock().ok()?;
+        if let Some(t) = *last {
+            if t.elapsed() < Self::REOPEN_INTERVAL {
+                return None;
+            }
+        }
+        *last = Some(Instant::now());
+        drop(last);
+
+        match DeckDriver::open() {
+            Ok(d) => {
+                let arc = Arc::new(d);
+                if let Ok(mut g) = self.inner.lock() {
+                    *g = Some(arc.clone());
+                }
+                eprintln!("\ndriver: reopened");
+                Some(arc)
+            }
+            Err(_) => None,
+        }
+    }
+
+    fn invalidate(&self) {
+        if let Ok(mut g) = self.inner.lock() {
+            *g = None;
+        }
+    }
+
+    /// Whether a handle is currently held. Diagnostic only — the answer can
+    /// race with another thread invalidating, so don't gate I/O on it.
+    pub fn is_open(&self) -> bool {
+        self.inner.lock().ok().is_some_and(|g| g.is_some())
+    }
+
+    pub fn push_input(&self, report: &[u8]) -> io::Result<()> {
+        let Some(d) = self.current() else {
+            return Err(io::Error::new(
+                io::ErrorKind::NotConnected,
+                "driver not open",
+            ));
+        };
+        match d.push_input(report) {
+            Ok(()) => Ok(()),
+            Err(e) => {
+                self.invalidate();
+                Err(e)
+            }
+        }
+    }
+
+    pub fn pend_output(&self, buf: &mut [u8]) -> io::Result<usize> {
+        let Some(d) = self.current() else {
+            return Err(io::Error::new(
+                io::ErrorKind::NotConnected,
+                "driver not open",
+            ));
+        };
+        match d.pend_output(buf) {
+            Ok(n) => Ok(n),
+            Err(e) => {
+                self.invalidate();
+                Err(e)
+            }
         }
     }
 }

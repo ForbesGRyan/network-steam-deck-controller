@@ -81,22 +81,6 @@ mod linux {
     pub fn run() {
         let (path, target) = parse_args();
 
-        let file = match OpenOptions::new().read(true).write(true).open(&path) {
-            Ok(f) => f,
-            Err(e) => {
-                // Fall back to read-only — feature-report writes will fail
-                // but the input path still works for diagnostic runs without
-                // root. Log so the failure mode is visible.
-                eprintln!("open RW {path}: {e}; retrying read-only");
-                match File::open(&path) {
-                    Ok(f) => f,
-                    Err(e2) => {
-                        eprintln!("open RO {path}: {e2}");
-                        std::process::exit(1);
-                    }
-                }
-            }
-        };
         let socket = target.map(open_socket);
 
         match target {
@@ -106,23 +90,56 @@ mod linux {
 
         // Output thread: only spawned when we're in send mode. The Deck has
         // nothing useful to do with rumble traffic if there's no Windows
-        // peer to drive it.
+        // peer to drive it. Each thread opens its own hidraw fd so we can
+        // re-open one side without disturbing the other.
         if target.is_some() {
-            match file.try_clone() {
-                Ok(write_fd) => {
-                    std::thread::Builder::new()
-                        .name("deck-output".into())
-                        .spawn(move || run_output_loop(write_fd))
-                        .ok();
-                }
-                Err(e) => eprintln!("hidraw try_clone for output thread: {e}"),
-            }
+            let path_for_output = path.clone();
+            std::thread::Builder::new()
+                .name("deck-output".into())
+                .spawn(move || run_output_loop(&path_for_output))
+                .ok();
         }
 
-        run_input_loop(file, target, socket);
+        run_input_loop(&path, target, socket);
     }
 
-    fn run_input_loop(mut file: File, target: Option<SocketAddr>, socket: Option<UdpSocket>) {
+    /// Open hidraw read-write, falling back to read-only if RW fails (the
+    /// caller may not be root). Returns `None` so the loop can decide
+    /// whether to wait + retry — process exit on first failure makes
+    /// systemd-supervised runs flap when the device is briefly absent
+    /// (USB transient, kernel module reload).
+    fn try_open_hidraw(path: &str) -> Option<File> {
+        match OpenOptions::new().read(true).write(true).open(path) {
+            Ok(f) => Some(f),
+            Err(rw_err) => match File::open(path) {
+                Ok(f) => {
+                    eprintln!("\nopen RW {path}: {rw_err}; using read-only");
+                    Some(f)
+                }
+                Err(ro_err) => {
+                    eprintln!("\nopen {path}: {ro_err}");
+                    None
+                }
+            },
+        }
+    }
+
+    /// Wait until hidraw can be opened, with a small backoff. Used after a
+    /// read failure surfaces a missing device (unplug, kernel reload).
+    fn wait_for_hidraw(path: &str) -> File {
+        let mut delay = Duration::from_millis(500);
+        let max_delay = Duration::from_secs(5);
+        loop {
+            if let Some(f) = try_open_hidraw(path) {
+                return f;
+            }
+            std::thread::sleep(delay);
+            delay = (delay * 2).min(max_delay);
+        }
+    }
+
+    fn run_input_loop(path: &str, target: Option<SocketAddr>, socket: Option<UdpSocket>) {
+        let mut file = wait_for_hidraw(path);
         let mut stats = Stats::default();
         let mut hid_buf = [0_u8; REPORT_LEN];
         let mut wire_buf = [0_u8; INPUT_PACKET_LEN];
@@ -132,16 +149,23 @@ mod linux {
         let mut stdout = std::io::stdout();
 
         loop {
-            if !read_one(&mut file, &mut hid_buf) {
-                continue;
-            }
-            if let Some(state) = decode_or_skip(&hid_buf, &mut stats) {
-                stats.frames += 1;
-                if let (Some(s), Some(t)) = (socket.as_ref(), target) {
-                    send_packet(s, t, &state, sequence, &mut wire_buf, &mut stats);
-                    sequence = sequence.wrapping_add(1);
+            match read_one(&mut file, &mut hid_buf) {
+                ReadResult::Ok => {
+                    if let Some(state) = decode_or_skip(&hid_buf, &mut stats) {
+                        stats.frames += 1;
+                        if let (Some(s), Some(t)) = (socket.as_ref(), target) {
+                            send_packet(s, t, &state, sequence, &mut wire_buf, &mut stats);
+                            sequence = sequence.wrapping_add(1);
+                        }
+                        last_state = Some(state);
+                    }
                 }
-                last_state = Some(state);
+                ReadResult::ShortOrInterrupted => {}
+                ReadResult::Reopen => {
+                    eprintln!("\ninput: reopening hidraw {path}");
+                    file = wait_for_hidraw(path);
+                    eprintln!("\ninput: reopened hidraw {path}");
+                }
             }
 
             // Always tick the print, even if every frame so far was the
@@ -156,8 +180,10 @@ mod linux {
 
     /// Listen on `OUTPUT_LISTEN_PORT` for OUTPUT-channel wire packets from
     /// `client-win`, decode the 64-byte feature-report body, and write it
-    /// back into the Deck's hidraw via `HIDIOCSFEATURE`.
-    fn run_output_loop(write_fd: File) {
+    /// back into the Deck's hidraw via `HIDIOCSFEATURE`. Re-opens the
+    /// hidraw fd if a write fails persistently — the same recovery story
+    /// as the input loop, with its own state so neither blocks the other.
+    fn run_output_loop(path: &str) {
         let bind = SocketAddr::new(Ipv4Addr::UNSPECIFIED.into(), OUTPUT_LISTEN_PORT);
         let sock = match UdpSocket::bind(bind) {
             Ok(s) => s,
@@ -168,6 +194,7 @@ mod linux {
         };
         eprintln!("output: listening on {bind} for rumble/haptic packets");
 
+        let mut write_fd = wait_for_hidraw(path);
         let mut buf = [0_u8; OUTPUT_PACKET_LEN];
         // Feature reports go through HIDIOCSFEATURE with byte 0 reserved
         // for the report ID. Our HID descriptor declares no report IDs, so
@@ -178,6 +205,11 @@ mod linux {
         let mut applied: u64 = 0;
         let mut out_of_order: u64 = 0;
         let mut hidraw_errors: u64 = 0;
+        // Threshold for treating HIDIOCSFEATURE failures as "the fd is
+        // dead, reopen." A flaky single ioctl shouldn't tear down — but a
+        // run of failures means the device went away.
+        const REOPEN_AFTER: u64 = 32;
+        let mut consecutive_errors: u64 = 0;
         let mut last_log = Instant::now();
 
         loop {
@@ -217,8 +249,20 @@ mod linux {
             feature_buf[0] = 0;
 
             match hidiocsfeature(write_fd.as_raw_fd(), &feature_buf) {
-                Ok(_) => applied += 1,
-                Err(_) => hidraw_errors += 1,
+                Ok(_) => {
+                    applied += 1;
+                    consecutive_errors = 0;
+                }
+                Err(_) => {
+                    hidraw_errors += 1;
+                    consecutive_errors += 1;
+                    if consecutive_errors >= REOPEN_AFTER {
+                        eprintln!("\noutput: reopening hidraw {path}");
+                        write_fd = wait_for_hidraw(path);
+                        consecutive_errors = 0;
+                        eprintln!("\noutput: reopened hidraw {path}");
+                    }
+                }
             }
 
             if last_log.elapsed() >= Duration::from_secs(2) {
@@ -268,20 +312,30 @@ mod linux {
         }
     }
 
-    /// Returns `true` if a full report was read into `buf`. On short reads
-    /// or recoverable errors prints and returns `false` so the caller can
-    /// loop. Fatal errors call `process::exit`.
-    fn read_one(file: &mut File, buf: &mut [u8; REPORT_LEN]) -> bool {
+    enum ReadResult {
+        Ok,
+        ShortOrInterrupted,
+        Reopen,
+    }
+
+    /// One non-fatal pass at reading from hidraw. Read errors that point at
+    /// a dead fd (anything except EINTR) signal a re-open — the fd is
+    /// likely stale (USB transient, kernel driver reload). EOF / short
+    /// reads stay non-fatal; the controller occasionally interleaves
+    /// shorter status reports with the 64-byte input ones.
+    fn read_one(file: &mut File, buf: &mut [u8; REPORT_LEN]) -> ReadResult {
         match file.read(buf) {
-            Ok(n) if n == REPORT_LEN => true,
+            Ok(n) if n == REPORT_LEN => ReadResult::Ok,
             Ok(n) => {
                 eprintln!("\nshort read: {n} bytes (expected {REPORT_LEN})");
-                false
+                ReadResult::ShortOrInterrupted
             }
-            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => false,
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {
+                ReadResult::ShortOrInterrupted
+            }
             Err(e) => {
                 eprintln!("\nread: {e}");
-                std::process::exit(1);
+                ReadResult::Reopen
             }
         }
     }
