@@ -7,6 +7,7 @@ description = "Windows side: receive controller state from Deck, hand HID report
 
 [dependencies]
 deck-protocol = { path = "../deck-protocol" }
+discovery = { path = "../discovery" }
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.59", features = [
