@@ -102,6 +102,8 @@ Tracked in detail in [ARCHITECTURE.md](ARCHITECTURE.md#build-sequence):
    appears in Steam. — done (Hyper-V VM with test signing)
 4. Feature-report path: lizard-mode disable, haptics-config ack. — done
    (Steam recognizes as Deck, `controller_neptune` config loads)
+5. User-mode IPC + live HID frames over IOCTL. — done
+   (`client-win --test` toggles the A button visible in Steam at 1 Hz)
 4. Feature-report path (lizard-mode disable, haptics-config ack).
 5. User-mode IPC + live HID frames over IOCTL.
 6. Deck server → network → driver end-to-end.

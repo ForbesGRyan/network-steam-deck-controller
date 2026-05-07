@@ -61,14 +61,42 @@ EvtIoDeviceControl(_In_ WDFQUEUE Queue,
                                                nullptr);
         if (!NT_SUCCESS(status)) break;
 
-        // TODO: hand `buf` (DECK_INPUT_REPORT_SIZE bytes) to the
-        // interrupt-IN endpoint of ctx->VirtualUsbDevice. Likely shape:
-        //   - look up the WDFREQUEST queued on the endpoint by the host;
-        //   - copy our bytes into its output buffer;
-        //   - WdfRequestComplete that endpoint-side request;
-        //   - status = STATUS_SUCCESS.
-        UNREFERENCED_PARAMETER(ctx);
-        status = STATUS_NOT_IMPLEMENTED;
+        // Pull the next host URB from the gamepad EP 0x83 IN queue. The
+        // host's USB stack submits these every ~1 ms (our descriptor's
+        // bInterval); they sit on this manual queue waiting for input.
+        WDFREQUEST epRequest;
+        NTSTATUS dq = WdfIoQueueRetrieveNextRequest(ctx->GamepadInQueue,
+                                                    &epRequest);
+        if (dq == STATUS_NO_MORE_ENTRIES) {
+            // No host URB pending — drop this report. At ~250 Hz from
+            // user-mode and ~1 kHz host polling we should normally have
+            // a URB ready; a drop here just means the host already has
+            // a fresher one in flight from some prior IOCTL.
+            status = STATUS_SUCCESS;
+            break;
+        }
+        if (!NT_SUCCESS(dq)) {
+            status = dq;
+            break;
+        }
+
+        // Copy our 64 bytes into the URB's transfer buffer and complete it.
+        PUCHAR urbBuf;
+        ULONG  urbLen;
+        NTSTATUS retrieve = UdecxUrbRetrieveBuffer(epRequest, &urbBuf, &urbLen);
+        if (!NT_SUCCESS(retrieve)) {
+            UdecxUrbCompleteWithNtStatus(epRequest, retrieve);
+            status = retrieve;
+            break;
+        }
+
+        const ULONG copyLen = (urbLen < DECK_INPUT_REPORT_SIZE)
+                                  ? urbLen : DECK_INPUT_REPORT_SIZE;
+        RtlCopyMemory(urbBuf, buf, copyLen);
+        UdecxUrbSetBytesCompleted(epRequest, copyLen);
+        UdecxUrbCompleteWithNtStatus(epRequest, STATUS_SUCCESS);
+
+        status = STATUS_SUCCESS;
         break;
     }
 

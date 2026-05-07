@@ -132,7 +132,13 @@ Signing path:
    `GET_ATTRIBUTES_VALUES` / `GET_STRING_ATTRIBUTE`. Haptic / rumble
    payloads are still discarded — that path lights up when step 7 wires
    them through to user-mode.*
-5. User-mode IPC + live HID frames over IOCTL.
+5. ✅ User-mode IPC + live HID frames over IOCTL.
+   *`IOCTL_DECK_PUSH_INPUT_REPORT` in `queue.cpp` dequeues the host's
+   pending interrupt-IN URB on EP 0x83, copies the user-mode-supplied
+   64-byte report into the URB buffer, and completes it. Verified
+   end-to-end with `client-win --test` synthesizing alternating-A-button
+   reports at ~250 Hz: Steam's Controller Layout test screen highlights
+   the A button on / off at 1 Hz.*
 6. Deck server reading hidraw → network → driver.
 7. Output path: rumble back to Deck.
 8. Polish: reconnect, pairing, packaging.

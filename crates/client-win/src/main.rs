@@ -10,7 +10,13 @@
 //! When the driver is not yet installed, runs in listen-only mode (the
 //! HID-encode path still executes as a self-test of the protocol crate).
 //!
-//! Usage: `client-win [port]` (default port 49152).
+//! Usage:
+//!   client-win [port]   - listen on UDP `port` for Deck input packets
+//!                         (default 49152)
+//!   client-win --test   - drive the IOCTL with a canned state pattern
+//!                         (alternates neutral / A pressed each second).
+//!                         Useful for end-to-end driver bring-up
+//!                         without a real Deck server attached.
 
 use std::io::Write;
 use std::net::{Ipv4Addr, SocketAddr, UdpSocket};
@@ -18,7 +24,7 @@ use std::time::{Duration, Instant};
 
 use deck_protocol::hid;
 use deck_protocol::wire::{self, Channel, Header, HEADER_LEN, INPUT_PACKET_LEN};
-use deck_protocol::ControllerState;
+use deck_protocol::{Buttons, ControllerState};
 
 #[cfg(windows)]
 mod driver;
@@ -41,10 +47,13 @@ struct Stats {
 }
 
 fn main() {
-    let port: u16 = std::env::args()
-        .nth(1)
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(DEFAULT_PORT);
+    let arg = std::env::args().nth(1);
+    if matches!(arg.as_deref(), Some("--test")) {
+        run_test_mode();
+        return;
+    }
+
+    let port: u16 = arg.and_then(|s| s.parse().ok()).unwrap_or(DEFAULT_PORT);
 
     let bind = SocketAddr::new(Ipv4Addr::UNSPECIFIED.into(), port);
     let sock = match UdpSocket::bind(bind) {
@@ -65,7 +74,10 @@ fn main() {
 
     let mut stats = Stats::default();
     let mut buf = [0_u8; INPUT_PACKET_LEN];
-    let mut hid_buf = [0_u8; hid::REPORT_LEN];
+    // Driver IOCTL expects exactly DECK_INPUT_REPORT_SIZE (64) bytes; the
+    // protocol crate's encode produces hid::REPORT_LEN (60) — pad with the
+    // zero tail so the trailing 4 bytes match what real Deck firmware sends.
+    let mut hid_buf = [0_u8; driver::INPUT_REPORT_SIZE];
     let mut last_print = Instant::now();
     let mut stdout = std::io::stdout();
 
@@ -90,7 +102,7 @@ fn main() {
             continue;
         };
 
-        if hid::encode_input_report(&state, &mut hid_buf).is_err() {
+        if hid::encode_input_report(&state, &mut hid_buf[..hid::REPORT_LEN]).is_err() {
             stats.wire_errors += 1;
             continue;
         }
@@ -193,6 +205,73 @@ fn open_driver_with_pend_thread() -> Option<Arc<driver::DeckDriver>> {
             None
         }
     }
+}
+
+/// Drive the kernel-side IOCTL with a synthetic input pattern so the full
+/// chain can be exercised before the Deck server is wired up. Toggles the
+/// `A` button each second; everything else stays at idle.
+#[cfg(windows)]
+fn run_test_mode() {
+    let driver = match driver::DeckDriver::open() {
+        Ok(d) => d,
+        Err(e) => {
+            eprintln!("driver: not available ({e}); test mode requires the driver");
+            std::process::exit(1);
+        }
+    };
+    eprintln!("driver: opened (test mode — synthesizing input @ ~250 Hz)");
+
+    let mut state = ControllerState::default();
+    let mut hid_buf = [0_u8; driver::INPUT_REPORT_SIZE];
+    let push_period = Duration::from_millis(4);
+    let toggle_period = Duration::from_secs(1);
+
+    let mut sequence: u32 = 0;
+    let mut a_pressed = false;
+    let mut last_toggle = Instant::now();
+    let mut last_print = Instant::now();
+    let mut pushed: u64 = 0;
+    let mut errors: u64 = 0;
+    let mut stdout = std::io::stdout();
+
+    loop {
+        if last_toggle.elapsed() >= toggle_period {
+            last_toggle = Instant::now();
+            a_pressed = !a_pressed;
+        }
+        state.sequence = sequence;
+        sequence = sequence.wrapping_add(1);
+        state.buttons = if a_pressed { Buttons::A } else { Buttons::empty() };
+
+        if hid::encode_input_report(&state, &mut hid_buf[..hid::REPORT_LEN]).is_err() {
+            errors += 1;
+        } else {
+            match driver.push_input(&hid_buf) {
+                Ok(()) => pushed += 1,
+                Err(_) => errors += 1,
+            }
+        }
+
+        if last_print.elapsed() >= PRINT_EVERY {
+            last_print = Instant::now();
+            let _ = write!(
+                stdout,
+                "\x1b[2K\rpushed={pushed:>8} err={errors:>4} \
+                 a={} seq={}",
+                if a_pressed { '1' } else { '0' },
+                sequence,
+            );
+            let _ = stdout.flush();
+        }
+
+        std::thread::sleep(push_period);
+    }
+}
+
+#[cfg(not(windows))]
+fn run_test_mode() {
+    eprintln!("--test mode requires Windows (driver IPC); exiting");
+    std::process::exit(1);
 }
 
 #[cfg(windows)]
