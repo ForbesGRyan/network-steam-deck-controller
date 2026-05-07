@@ -7,6 +7,17 @@
 *.iml
 *.swp
 
+# Visual Studio (driver project)
+/.vs/
+/CppProperties.json
+*.vcxproj.user
+# Build output for the WDK project — outside Cargo's /target/ above.
+/driver/NetworkDeckController/x64/
+/driver/NetworkDeckController/ARM64/
+# Auto-generated INF that VS drops next to the .vcxproj — we use the
+# hand-authored one at driver/inf/NetworkDeckController.inf instead.
+/driver/NetworkDeckController/NetworkDeckController.inf
+
 # OS junk
 Thumbs.db
 .DS_Store

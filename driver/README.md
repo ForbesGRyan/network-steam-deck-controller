@@ -107,25 +107,45 @@ pnputil /delete-driver oem15.inf /uninstall
 - Establish the WDF + UDE skeleton (DriverEntry, EvtDriverDeviceAdd,
   device interface registration, IOCTL queue, manual queue for pended
   output reports).
+- Carry the **real** USB and HID descriptors for the Steam Deck
+  controller (VID 0x28de PID 0x1205) inside `usbdevice.cpp`: device
+  descriptor, full 150-byte configuration descriptor with all five
+  interfaces (kbd / mouse / vendor-HID gamepad / CDC ACM ×2), HID
+  report descriptors for IF0 / IF1 / IF2, and string descriptors. All
+  bytes are sourced from real hardware via three public projects —
+  see the file's header comment and the memory note
+  `deck_descriptor_sources.md` for citations and a known firmware
+  discrepancy (IF2's report descriptor is 29 bytes, not 25).
+- Bring up the virtual USB device end-to-end: `UsbDeviceCreate` calls
+  `UdecxUsbDeviceInitAllocate` → state callbacks → set speed/endpoints
+  type → add device + config + 4 string descriptors → `UdecxUsbDeviceCreate`
+  → create EP0 (control) + 6 data endpoints (0x81/0x82/0x83/0x84/0x85/0x05)
+  → `UdecxUsbDevicePlugIn`. After load Windows enumerates "Steam Deck
+  Controller" under Human Interface Devices.
+- Service HID class requests on EP0: `GET_DESCRIPTOR(REPORT)` returns the
+  three report descriptors keyed by interface index; `SET_IDLE` /
+  `SET_PROTOCOL` / `GET_IDLE` / `GET_PROTOCOL` / `GET_REPORT` /
+  `SET_REPORT` get sensible defaults so the HID class driver completes
+  init.
 - Provide a working INF.
 
 **Does not (TODO):**
-- USB descriptors are placeholder bytes. Capture from a real Deck on
-  Windows (USBView, UVCView in WDK, or `Get-PnpDeviceProperty`) and
-  replace the byte arrays in `usbdevice.cpp`.
-- HID report descriptor — same.
-- `UDECX_WDF_DEVICE_CONFIG_INIT` callback set is stubbed; Microsoft's UDE
-  sample shows the right initializer pattern with current WDK headers.
-- `UsbDeviceCreate` body is `STATUS_NOT_IMPLEMENTED`. Real implementation
-  goes through `UdecxUsbDeviceInitAllocate` →
-  `UdecxUsbDeviceInitAddDescriptor` (×N) → `UdecxUsbDeviceCreate` →
-  `UdecxUsbEndpointCreate` (×N) → `UdecxUsbDevicePlugIn`.
-- Input report path: routing bytes from the IOCTL to a queued endpoint
-  request is a TODO inside `EvtIoDeviceControl`.
-- Output report path: the manual queue exists but nothing completes
-  parked requests yet. The completion site is wherever
-  `EvtUsbEndpointReady` (interrupt-OUT) or feature-set callback fires
-  inside `usbdevice.cpp`.
+- Input report path: routing bytes from `IOCTL_DECK_PUSH_INPUT_REPORT`
+  to the gamepad endpoint's queue (`ctx->GamepadInQueue`, EP 0x83) is a
+  TODO inside `EvtIoDeviceControl` in `queue.cpp`. The shape: dequeue
+  the host's pending interrupt-IN request via
+  `WdfIoQueueRetrieveNextRequest`, copy 64 bytes into its output buffer
+  via `WdfRequestRetrieveOutputBuffer`, complete it.
+- Output report path: `SET_REPORT(FEATURE/OUTPUT)` on IF2 currently
+  returns `STATUS_SUCCESS` but discards the payload. Hook it up to
+  `ctx->PendedOutputQueue` so user-mode (client-win) can ship rumble /
+  haptic commands back to the Deck.
+- Canned-report timer: a `WDFTIMER` pumping a neutral 64-byte input
+  report into `ctx->GamepadInQueue` at ~250 Hz so something visible
+  happens before user-mode is wired. Useful for early bring-up debug.
+- INF: catalog (`.cat`) is unsigned. Test-mode signing covers it during
+  development, but for distribution you'll need an EV cert + Microsoft
+  Partner Center attestation signing.
 
 The build sequence in `../ARCHITECTURE.md` calls these out in order:
 

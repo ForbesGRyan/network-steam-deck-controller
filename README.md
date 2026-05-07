@@ -6,10 +6,12 @@ on Windows handles all gameplay-side mapping (gyro, trackpads, back paddles,
 per-game profiles).
 
 > **Status:** early-stage scaffold. Rust crates compile and pass 13 unit
-> tests; the Windows kernel driver is a skeleton waiting on WDK setup;
-> nothing has been validated against real hardware yet. See
-> [ARCHITECTURE.md](ARCHITECTURE.md) for the full design and pending
-> validations.
+> tests. The Deck → hidraw → wire pipeline has been validated on real
+> hardware (`BUTTON_MAP` confirmed for everything the kernel driver
+> exposes). The Windows kernel driver carries real Steam Deck USB +
+> HID descriptors but its UDE bring-up bodies are still stubbed pending
+> WDK install. See [ARCHITECTURE.md](ARCHITECTURE.md) for the full
+> design and remaining validations.
 
 ## Why
 
@@ -95,9 +97,10 @@ the Deck.
 Tracked in detail in [ARCHITECTURE.md](ARCHITECTURE.md#build-sequence):
 
 1. Lift Deck HID layout into `deck-protocol`. — done
-2. Hidraw spike: validate `BUTTON_MAP` against real hardware. — pending
+2. Hidraw spike: validate `BUTTON_MAP` against real hardware. — done
 3. Static UDE driver: descriptors, plug-in flow, "Steam Deck Controls"
-   appears in Steam. — pending (scaffold only)
+   appears in Steam. — descriptors landed, bring-up bodies pending
+   WDK install
 4. Feature-report path (lizard-mode disable, haptics-config ack).
 5. User-mode IPC + live HID frames over IOCTL.
 6. Deck server → network → driver end-to-end.

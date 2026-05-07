@@ -2,9 +2,15 @@
 // delegate UDE setup to usbdevice.cpp, IOCTLs to queue.cpp.
 //
 // API reference:
-//   - Microsoft Windows-driver-samples/usb/UDE_*  (canonical UDE sample)
+//   - microsoft/UDE  UDEMbimClientSample/{driver,controller,usbdevice}.cpp
 //   - https://learn.microsoft.com/en-us/windows-hardware/drivers/ddi/udecx/
 
+// INITGUID must precede the first include of any header that uses
+// DEFINE_GUID (for us: public.h). Defining it here causes storage for
+// GUID_DEVINTERFACE_DECK_VIRTUAL to be emitted in this translation unit.
+// Other .cpp files transitively pulling public.h get extern declarations,
+// linker resolves to this definition.
+#include <initguid.h>
 #include "common.h"
 
 extern "C" DRIVER_INITIALIZE DriverEntry;
@@ -29,8 +35,7 @@ EvtDriverDeviceAdd(_In_ WDFDRIVER Driver, _Inout_ PWDFDEVICE_INIT DeviceInit)
 
     NTSTATUS status;
 
-    // Tell the framework we'll be a UDE controller. This must precede
-    // WdfDeviceCreate.
+    // Tell the framework we'll be a UDE controller. Must precede WdfDeviceCreate.
     status = UdecxInitializeWdfDeviceInit(DeviceInit);
     if (!NT_SUCCESS(status)) return status;
 
@@ -41,11 +46,11 @@ EvtDriverDeviceAdd(_In_ WDFDRIVER Driver, _Inout_ PWDFDEVICE_INIT DeviceInit)
     status = WdfDeviceCreate(&DeviceInit, &deviceAttrs, &device);
     if (!NT_SUCCESS(status)) return status;
 
-    // TODO: fill in UDECX_WDF_DEVICE_CONFIG (controller capabilities,
-    // controller-state callbacks). See Microsoft UDE sample's equivalent
-    // function for the right initializer pattern with current WDK.
+    // Register as a UDE-capable WDF device. The query-capability callback
+    // is required by the framework — UCX consults it to learn what speeds
+    // and features we expose. We claim "no extra capabilities" for now.
     UDECX_WDF_DEVICE_CONFIG udeConfig;
-    UDECX_WDF_DEVICE_CONFIG_INIT(&udeConfig, /* TODO: callbacks */ nullptr);
+    UDECX_WDF_DEVICE_CONFIG_INIT(&udeConfig, EvtControllerQueryUsbCapability);
 
     status = UdecxWdfDeviceAddUsbDeviceEmulation(device, &udeConfig);
     if (!NT_SUCCESS(status)) return status;
@@ -60,7 +65,26 @@ EvtDriverDeviceAdd(_In_ WDFDRIVER Driver, _Inout_ PWDFDEVICE_INIT DeviceInit)
     status = QueueInitialize(device);
     if (!NT_SUCCESS(status)) return status;
 
-    // Plug the virtual Deck into our virtual host controller. Windows now
-    // sees a USB device with VID 0x28de PID 0x1205 appear.
+    // Build the virtual Deck and plug it into our virtual host controller.
+    // Windows now sees a USB device with VID 0x28de PID 0x1205 appear.
     return UsbDeviceCreate(device);
+}
+
+NTSTATUS
+EvtControllerQueryUsbCapability(_In_ WDFDEVICE UdecxWdfDevice,
+                                _In_ PGUID     CapabilityType,
+                                _In_ ULONG     OutputBufferLength,
+                                _Out_writes_to_opt_(OutputBufferLength, *ResultLength) PVOID OutputBuffer,
+                                _Out_ PULONG   ResultLength)
+{
+    UNREFERENCED_PARAMETER(UdecxWdfDevice);
+    UNREFERENCED_PARAMETER(CapabilityType);
+    UNREFERENCED_PARAMETER(OutputBufferLength);
+    UNREFERENCED_PARAMETER(OutputBuffer);
+
+    // We don't expose any optional UCX capabilities (no static streams,
+    // no chained MDLs, no function suspend, etc.). Return zero length and
+    // STATUS_NOT_IMPLEMENTED for every query — UCX falls back to defaults.
+    *ResultLength = 0;
+    return STATUS_NOT_IMPLEMENTED;
 }

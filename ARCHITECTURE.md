@@ -115,13 +115,16 @@ Signing path:
 ## Build sequence
 
 1. ✅ Lift Deck HID layout into `deck-protocol` (Rust types + codec).
-2. ⏳ Spike: parse a real Deck input report on Linux via hidraw.
-   *Scaffold landed in `crates/server-deck` — **pending hardware validation**,
-   see [Pending validations](#pending-validations).*
+2. ✅ Spike: parse a real Deck input report on Linux via hidraw.
+   *Validated against real hardware; `BUTTON_MAP` confirmed for everything
+   the Linux kernel driver covers. Capacitive thumbstick touch bits remain
+   unknown and need a USB capture if/when they are wired up.*
 3. ⏳ Static UDE driver: hardcoded descriptors, canned report on a timer. Goal:
-   Steam shows "Steam Deck Controls." *Scaffold landed in `driver/` — files,
-   IOCTL contract, INF, README. Bodies stubbed (`STATUS_NOT_IMPLEMENTED`)
-   pending WDK setup; see `driver/README.md`.*
+   Steam shows "Steam Deck Controls." *Real descriptors landed in
+   `driver/src/usbdevice.cpp` — sourced from three public projects (see
+   memory `deck_descriptor_sources.md`). UDE bring-up bodies still stubbed
+   pending WDK install; the ten-step call sequence is documented inline at
+   the `UsbDeviceCreate` call site.*
 4. Feature-report path: lizard-mode disable, haptics-config ack.
 5. User-mode IPC + live HID frames over IOCTL.
 6. Deck server reading hidraw → network → driver.
@@ -132,40 +135,15 @@ Signing path:
 
 Things that need real hardware before the next protocol-extending step lands.
 
-### Deck hidraw spike (build sequence step 2)
+### Capacitive thumbstick touch bits
 
-`crates/server-deck` reads a Deck `/dev/hidraw*` node and decodes input
-reports through `deck-protocol`. The codec was lifted from kernel source
-without ever being run against a live device. **Run this before extending
-the protocol or driver further** — bit-position errors in `BUTTON_MAP`
-won't be caught by the existing round-trip tests.
-
-Procedure (full version in `crates/server-deck/src/main.rs` module docs):
-
-1. Copy workspace to Deck, `cargo build --release -p server-deck`.
-2. Stop Steam (it owns the controller).
-3. Find the controller's hidraw node by grepping
-   `/sys/class/hidraw/*/device/uevent` for `HID_ID=0003:000028DE:00001205`.
-4. Unbind `hid-steam` for that device id.
-5. `sudo ./target/release/server-deck /dev/hidrawN`.
-
-Validation checklist:
-
-| Input | Expected change |
-|---|---|
-| A / B / X / Y | matching `Buttons` flag toggles |
-| L1 / R1 + full L2 / R2 pulls | digital flags + analog `LT` / `RT` rises |
-| Sticks | `L(x,y)` / `R(x,y)` swing through full range, centered ≈ 0 |
-| Trackpads (touch + click) | `*PAD_TOUCH` / `*PAD_CLICK`, `left/right_pad` |
-| Steam / View / Menu / QAM | system flags |
-| L4 / L5 / R4 / R5 paddles | back-paddle flags |
-| Tilt the Deck | `gyro` non-zero, `accel` shifts |
-
-Any unexpected behavior = bit-position bug in `crates/deck-protocol/src/hid.rs::BUTTON_MAP`.
-Capacitive thumbstick touch is **not** covered by the kernel driver — its
-bit position is currently unknown and will need to be discovered from a USB
-capture (USBPcap on Windows or `usbmon` on Linux while a real Deck is
-attached).
+The Linux kernel driver does not parse capacitive-touch state for the
+analog sticks, so `BUTTON_MAP` in `crates/deck-protocol/src/hid.rs` has
+no entries for those bits. They need to be discovered from a USB capture
+(USBPcap on Windows or `usbmon` on Linux while a real Deck is attached)
+before they can be wired up. Mark any newly-discovered bits with a
+`// from USB capture YYYY-MM-DD` comment so future readers can tell
+kernel-sourced bits from capture-sourced ones.
 
 ## Decisions log
 
