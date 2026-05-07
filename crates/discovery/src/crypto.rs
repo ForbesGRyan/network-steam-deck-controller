@@ -48,13 +48,18 @@ mod tests {
 
     #[test]
     fn known_vector() {
-        // Lock the constant-string + sort-order so a future refactor that
-        // changes either is caught by an explicit failure here, not by a
-        // silent break in the field. Vector recomputed if we ever bump v1.
+        // Locks the INFO string + sort order. A future refactor that
+        // changes either is caught by an explicit byte mismatch here,
+        // not by silent breakage in the field.
         let a = [0x00_u8; 32];
         let b = [0xff_u8; 32];
-        let key = derive_session_key(&a, &b);
-        assert_eq!(key.len(), 32);
-        assert_eq!(key, derive_session_key(&b, &a));
+        let expected: [u8; 32] = [
+            0x49, 0x40, 0x4a, 0x8a, 0xa4, 0x9c, 0x44, 0x92,
+            0x00, 0x46, 0x49, 0x14, 0xf3, 0x9d, 0x3a, 0xf0,
+            0x2e, 0x22, 0xfb, 0x6c, 0x74, 0x93, 0x39, 0x5b,
+            0xa5, 0x0e, 0x19, 0xce, 0x24, 0x50, 0x1c, 0xec,
+        ];
+        assert_eq!(derive_session_key(&a, &b), expected);
+        assert_eq!(derive_session_key(&b, &a), expected);
     }
 }
