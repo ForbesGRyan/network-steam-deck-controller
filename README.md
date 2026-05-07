@@ -153,8 +153,9 @@ cargo test --workspace
 
    The unit uses `--state-dir /var/lib/network-deck`. Pair once manually
    (steps 1–2 above) before enabling the service, or stop the service,
-   run the `pair` subcommand with `--state-dir /var/lib/network-deck`, then
-   re-enable.
+   run `sudo -u deck server-deck pair /dev/hidraw3 --state-dir /var/lib/network-deck`
+   (`/var/lib/network-deck` is owned by the `deck` user via `StateDirectory=`),
+   then re-enable.
 
 ### What you'll see
 

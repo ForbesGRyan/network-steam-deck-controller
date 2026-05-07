@@ -7,8 +7,9 @@
 #
 # First-time setup: pair with the Windows PC by running
 #   sudo systemctl stop network-deck-server.service
-#   /usr/local/bin/server-deck pair /dev/hidraw3 --state-dir /var/lib/network-deck
+#   sudo -u deck /usr/local/bin/server-deck pair /dev/hidraw3 --state-dir /var/lib/network-deck
 # while `client-win pair` is running on the PC, then re-enable the unit.
+# (`/var/lib/network-deck` is owned by the `deck` user via `StateDirectory=`)
 
 [Unit]
 Description=Network Deck input bridge (Steam Deck -> Windows)
