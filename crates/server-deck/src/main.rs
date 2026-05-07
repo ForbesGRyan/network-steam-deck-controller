@@ -189,11 +189,12 @@ mod linux {
         let path_for_output = args.hidraw_path.clone();
         let beacon_for_output = beacon.clone();
         let bound_for_output = bound.try_clone().expect("clone bound socket");
+        let auth_key_for_output = auth_key.clone();
         std::thread::Builder::new()
             .name("deck-output".into())
             .spawn(move || run_output_loop(
                 &path_for_output,
-                auth_key.as_ref(),
+                auth_key_for_output.as_ref(),
                 bound_for_output,
                 beacon_for_output,
             ))
@@ -302,7 +303,12 @@ mod linux {
         eprintln!("output: listening on 0.0.0.0:{OUTPUT_LISTEN_PORT} for rumble/haptic packets");
 
         let mut write_fd = wait_for_hidraw(path);
-        let mut buf = [0_u8; OUTPUT_PACKET_LEN.max(discovery::packet::PACKET_LEN)];
+        const BUF_LEN: usize = if OUTPUT_PACKET_LEN > discovery::packet::PACKET_LEN {
+            OUTPUT_PACKET_LEN
+        } else {
+            discovery::packet::PACKET_LEN
+        };
+        let mut buf = [0_u8; BUF_LEN];
         // Feature reports go through HIDIOCSFEATURE with byte 0 reserved
         // for the report ID. Our HID descriptor declares no report IDs, so
         // byte 0 is always zero; bytes 1..65 carry the 64 payload bytes.
@@ -330,7 +336,7 @@ mod linux {
             };
 
             // Demux beacon vs data.
-            if n >= 4 && buf[0..4] == *discovery::BEACON_MAGIC {
+            if n >= 4 && buf[0..4] == discovery::BEACON_MAGIC {
                 beacon.handle_packet(src, &buf[..n]);
                 continue;
             }
