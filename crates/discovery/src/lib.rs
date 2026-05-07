@@ -15,3 +15,8 @@ pub mod packet;
 pub mod pair;
 pub mod state_dir;
 pub mod trust;
+
+pub use beacon::Beacon;
+pub use identity::{load_or_generate as load_or_generate_identity, Identity};
+pub use packet::MAGIC as BEACON_MAGIC;
+pub use trust::{load as load_trust, save as save_trust, TrustedPeer};
