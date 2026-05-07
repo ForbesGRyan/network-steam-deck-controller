@@ -76,16 +76,3 @@ pub struct Vec3i {
     /// Z component.
     pub z: i16,
 }
-
-/// Output report: rumble command sent Windows → Deck.
-///
-/// Magnitudes are 0–65535. `duration_ms == 0` stops rumble.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct RumbleCommand {
-    /// Strong (left) motor magnitude.
-    pub left_magnitude: u16,
-    /// Weak (right) motor magnitude.
-    pub right_magnitude: u16,
-    /// Duration in milliseconds. `0` stops rumble.
-    pub duration_ms: u16,
-}

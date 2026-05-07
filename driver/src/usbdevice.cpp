@@ -332,11 +332,74 @@ BuildFeatureResponse(_In_reads_bytes_(DECK_OUTPUT_REPORT_SIZE) const UCHAR *requ
     case DECK_MSG_TRIGGER_HAPTIC_CMD:
     case DECK_MSG_TRIGGER_RUMBLE_CMD:
     default:
-        // Ack-only: echo msg_id with zero-length payload.
-        // TODO: route haptic/rumble payloads to PendedOutputQueue so
-        // user-mode can ship them back to the Deck.
+        // Ack-only: echo msg_id with zero-length payload. Haptic/rumble
+        // payload forwarding to user-mode happens in
+        // ForwardFeatureToPendedOutput() before this builder runs.
         break;
     }
+}
+
+// ---------------------------------------------------------------------------
+// Forward a SET_REPORT(FEATURE) payload to the next pended user-mode IOCTL
+// when it carries a haptic/rumble command.
+//
+// Steam emits these whenever a game wants to vibrate the controller. We park
+// IOCTL_DECK_PEND_OUTPUT_REPORT requests on PendedOutputQueue from
+// queue.cpp; here we pull one off and complete it with the raw 64-byte
+// feature-report payload. user-mode (`client-win`) ships the bytes back
+// across the network to `server-deck`, which writes them into the real
+// Deck's hidraw — both ends speak the same Steam Controller dialect, so the
+// payload passes through unmodified.
+//
+// If no IOCTL is currently pended (user-mode is slow, or hasn't connected),
+// the payload is dropped silently. Steam fires haptic commands at
+// ~250 Hz under continuous rumble; missing one frame is not perceptible.
+// ---------------------------------------------------------------------------
+static VOID
+ForwardFeatureToPendedOutput(_In_ PDEVICE_CONTEXT ctx,
+                             _In_reads_bytes_(reportLen) const UCHAR *report,
+                             _In_ ULONG reportLen)
+{
+    if (reportLen < 1) return;
+
+    const UCHAR msgId = report[0];
+    if (msgId != DECK_MSG_TRIGGER_HAPTIC_CMD &&
+        msgId != DECK_MSG_TRIGGER_HAPTIC_PULSE &&
+        msgId != DECK_MSG_TRIGGER_RUMBLE_CMD) {
+        return;
+    }
+
+    WDFREQUEST pended;
+    NTSTATUS dq = WdfIoQueueRetrieveNextRequest(ctx->PendedOutputQueue, &pended);
+    if (!NT_SUCCESS(dq)) {
+        // STATUS_NO_MORE_ENTRIES is the common case (user-mode not yet
+        // pending). Silently drop.
+        return;
+    }
+
+    PVOID outBuf;
+    size_t outLen;
+    NTSTATUS rb = WdfRequestRetrieveOutputBuffer(pended, DECK_OUTPUT_REPORT_SIZE,
+                                                 &outBuf, &outLen);
+    if (!NT_SUCCESS(rb)) {
+        WdfRequestComplete(pended, rb);
+        return;
+    }
+
+    const ULONG copyLen = (reportLen < DECK_OUTPUT_REPORT_SIZE)
+                              ? reportLen : DECK_OUTPUT_REPORT_SIZE;
+    if (outLen < copyLen) {
+        WdfRequestComplete(pended, STATUS_BUFFER_TOO_SMALL);
+        return;
+    }
+    RtlCopyMemory(outBuf, report, copyLen);
+    if (copyLen < DECK_OUTPUT_REPORT_SIZE && outLen >= DECK_OUTPUT_REPORT_SIZE) {
+        // Pad short payloads to a full feature-report so the Deck side can
+        // always rely on a fixed-size body.
+        RtlZeroMemory(static_cast<PUCHAR>(outBuf) + copyLen,
+                      DECK_OUTPUT_REPORT_SIZE - copyLen);
+    }
+    WdfRequestCompleteWithInformation(pended, STATUS_SUCCESS, DECK_OUTPUT_REPORT_SIZE);
 }
 
 EVT_WDF_IO_QUEUE_IO_INTERNAL_DEVICE_CONTROL EvtControlUrb;
@@ -434,15 +497,14 @@ EvtControlUrb(_In_ WDFQUEUE Queue,
 
         case HID_REQUEST_SET_REPORT:
             // Feature reports on IF2 are the Steam Controller request channel
-            // (set-then-get pattern). Build the corresponding canned reply
-            // and stash it for the next GET_REPORT.
-            //
-            // TODO: when the request is a haptic / rumble command
-            // (DECK_MSG_TRIGGER_HAPTIC_CMD/PULSE/RUMBLE), forward the args
-            // to PendedOutputQueue so user-mode can ship rumble back to
-            // the Deck.
+            // (set-then-get pattern): build a canned reply for the next
+            // GET_REPORT, AND forward haptic/rumble payloads to user-mode so
+            // they can travel back to the real Deck. Steam writes both kinds
+            // of feature reports here; ForwardFeatureToPendedOutput filters
+            // by msg_id.
             if (reportType == HID_REPORT_TYPE_FEATURE && buffer != nullptr) {
                 BuildFeatureResponse(buffer, bufferLength, ctx->LastFeatureResponse);
+                ForwardFeatureToPendedOutput(ctx, buffer, bufferLength);
             }
             status = STATUS_SUCCESS;
             break;

@@ -27,17 +27,15 @@
 
 use std::io::Write;
 use std::net::{Ipv4Addr, SocketAddr, UdpSocket};
-use std::time::{Duration, Instant};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use deck_protocol::hid;
-use deck_protocol::wire::{self, Channel, Header, HEADER_LEN, INPUT_PACKET_LEN};
+use deck_protocol::wire::{self, Channel, Header, HEADER_LEN, INPUT_PACKET_LEN, OUTPUT_PACKET_LEN};
 use deck_protocol::{Buttons, ControllerState};
 
 #[cfg(windows)]
 mod driver;
-
-#[cfg(windows)]
-use std::sync::Arc;
 
 const DEFAULT_PORT: u16 = 49152;
 const PRINT_EVERY: Duration = Duration::from_millis(50);
@@ -83,8 +81,14 @@ fn main() {
 
     eprintln!("client-win listening on {bind} (Ctrl-C to quit)");
 
+    // Latest input-packet source address. The output (rumble) thread reads
+    // this so it can ship feedback back to whichever Deck most recently
+    // reached us — no separate config flag, the pairing is implicit in the
+    // input flow direction.
+    let latest_src: Arc<Mutex<Option<SocketAddr>>> = Arc::new(Mutex::new(None));
+
     #[cfg(windows)]
-    let driver = open_driver_with_pend_thread();
+    let driver = open_driver_with_pend_thread(&sock, &latest_src);
     #[cfg(not(windows))]
     eprintln!("driver IPC: requires Windows; running listen-only");
 
@@ -95,56 +99,12 @@ fn main() {
     // zero tail so the trailing 4 bytes match what real Deck firmware sends.
     let mut hid_buf = [0_u8; driver::INPUT_REPORT_SIZE];
     let mut last_print = Instant::now();
-    let mut last_recv_log = Instant::now();
     let mut stdout = std::io::stdout();
-    let mut idle_since = Instant::now();
-    let mut idle_logged = false;
-    let mut total_received: u64 = 0;
-    let mut total_recv_bytes: u64 = 0;
-    let mut first_pkt_logged = false;
+    let mut diag = RecvDiag::new(bind);
 
     loop {
-        let n = match sock.recv_from(&mut buf) {
-            Ok((n, src)) => {
-                total_received += 1;
-                total_recv_bytes += n as u64;
-                idle_since = Instant::now();
-                idle_logged = false;
-                if !first_pkt_logged {
-                    eprintln!(
-                        "\nfirst UDP packet: {n} bytes from {src} \
-                         (will print one-time per-source log every 2 s)"
-                    );
-                    first_pkt_logged = true;
-                }
-                if last_recv_log.elapsed() >= Duration::from_secs(2) {
-                    last_recv_log = Instant::now();
-                    eprintln!(
-                        "\nrecv heartbeat: total_pkts={total_received} bytes={total_recv_bytes} \
-                         last_src={src} last_size={n}"
-                    );
-                }
-                n
-            }
-            Err(e)
-                if matches!(
-                    e.kind(),
-                    std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock
-                ) =>
-            {
-                if !idle_logged && idle_since.elapsed() >= Duration::from_secs(5) {
-                    eprintln!(
-                        "\nidle: no UDP for 5 s. total_pkts={total_received} \
-                         (sock {bind})"
-                    );
-                    idle_logged = true;
-                }
-                continue;
-            }
-            Err(e) => {
-                eprintln!("\nrecv: {e}");
-                continue;
-            }
+        let Some(n) = diag.recv(&sock, &mut buf, &latest_src) else {
+            continue;
         };
 
         let Some((hdr, state)) = parse_packet(&buf, n, &mut stats) else {
@@ -168,6 +128,85 @@ fn main() {
         if last_print.elapsed() >= PRINT_EVERY {
             last_print = Instant::now();
             print_status(&mut stdout, &stats, &hdr, &state);
+        }
+    }
+}
+
+/// Wraps `UdpSocket::recv_from` with the diagnostic counters/heartbeats the
+/// listen loop wants — the silent-recv UX bug came back to bite once before,
+/// so this consolidates the bookkeeping and updates `latest_src` while it's
+/// at it (the rumble thread reads that to route output back).
+struct RecvDiag {
+    bind: SocketAddr,
+    last_recv_log: Instant,
+    idle_since: Instant,
+    idle_logged: bool,
+    total_received: u64,
+    total_recv_bytes: u64,
+    first_pkt_logged: bool,
+}
+
+impl RecvDiag {
+    fn new(bind: SocketAddr) -> Self {
+        let now = Instant::now();
+        Self {
+            bind,
+            last_recv_log: now,
+            idle_since: now,
+            idle_logged: false,
+            total_received: 0,
+            total_recv_bytes: 0,
+            first_pkt_logged: false,
+        }
+    }
+
+    fn recv(
+        &mut self,
+        sock: &UdpSocket,
+        buf: &mut [u8],
+        latest_src: &Mutex<Option<SocketAddr>>,
+    ) -> Option<usize> {
+        match sock.recv_from(buf) {
+            Ok((n, src)) => {
+                self.total_received += 1;
+                self.total_recv_bytes += n as u64;
+                self.idle_since = Instant::now();
+                self.idle_logged = false;
+                if let Ok(mut s) = latest_src.lock() {
+                    *s = Some(src);
+                }
+                if !self.first_pkt_logged {
+                    eprintln!("\nfirst UDP packet: {n} bytes from {src}");
+                    self.first_pkt_logged = true;
+                }
+                if self.last_recv_log.elapsed() >= Duration::from_secs(2) {
+                    self.last_recv_log = Instant::now();
+                    eprintln!(
+                        "\nrecv heartbeat: total_pkts={} bytes={} last_src={src} last_size={n}",
+                        self.total_received, self.total_recv_bytes,
+                    );
+                }
+                Some(n)
+            }
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock
+                ) =>
+            {
+                if !self.idle_logged && self.idle_since.elapsed() >= Duration::from_secs(5) {
+                    eprintln!(
+                        "\nidle: no UDP for 5 s. total_pkts={} (sock {})",
+                        self.total_received, self.bind,
+                    );
+                    self.idle_logged = true;
+                }
+                None
+            }
+            Err(e) => {
+                eprintln!("\nrecv: {e}");
+                None
+            }
         }
     }
 }
@@ -237,15 +276,31 @@ fn print_status<W: Write>(out: &mut W, stats: &Stats, hdr: &Header, state: &Cont
 }
 
 #[cfg(windows)]
-fn open_driver_with_pend_thread() -> Option<Arc<driver::DeckDriver>> {
+fn open_driver_with_pend_thread(
+    sock: &UdpSocket,
+    latest_src: &Arc<Mutex<Option<SocketAddr>>>,
+) -> Option<Arc<driver::DeckDriver>> {
     match driver::DeckDriver::open() {
         Ok(d) => {
             eprintln!("driver: opened");
             let arc = Arc::new(d);
             let pend_handle = arc.clone();
+            // Clone the bound socket so the output thread can send_to the
+            // Deck on the same port we listen on. Replies come back via the
+            // OS source-address; we infer the Deck's listen port from the
+            // wire-protocol convention (DEFAULT_PORT) rather than echoing to
+            // src.port — the Deck's outgoing source port is ephemeral.
+            let send_sock = match sock.try_clone() {
+                Ok(s) => s,
+                Err(e) => {
+                    eprintln!("socket clone for output thread: {e}");
+                    return Some(arc);
+                }
+            };
+            let src_handle = latest_src.clone();
             std::thread::Builder::new()
                 .name("deck-pend-output".into())
-                .spawn(move || pend_output_loop(&pend_handle))
+                .spawn(move || pend_output_loop(&pend_handle, &send_sock, &src_handle))
                 .ok();
             Some(arc)
         }
@@ -415,18 +470,81 @@ fn run_replay_mode(_path: &str) {
     std::process::exit(1);
 }
 
+/// Park on the driver's output IOCTL; whenever Steam writes a haptic/rumble
+/// feature report, ship it back over UDP to whichever address last sent us
+/// input. Best-effort: we do not retransmit, do not buffer. A dropped
+/// rumble frame is imperceptible at Steam's ~250 Hz cadence.
 #[cfg(windows)]
-fn pend_output_loop(driver: &driver::DeckDriver) {
+fn pend_output_loop(
+    driver: &driver::DeckDriver,
+    send_sock: &UdpSocket,
+    latest_src: &Arc<Mutex<Option<SocketAddr>>>,
+) {
     let mut buf = [0_u8; driver::OUTPUT_REPORT_SIZE];
+    let mut wire_buf = [0_u8; OUTPUT_PACKET_LEN];
+    let mut sequence: u32 = 0;
+    let mut sent: u64 = 0;
+    let mut send_errors: u64 = 0;
+    let mut no_target: u64 = 0;
+    let mut last_log = Instant::now();
+
     loop {
-        match driver.pend_output(&mut buf) {
-            Ok(n) => {
-                eprintln!("\noutput report ({n} bytes): {:02x?}", &buf[..n]);
-            }
+        let n = match driver.pend_output(&mut buf) {
+            Ok(n) => n,
             Err(e) => {
                 eprintln!("\npend_output: {e}");
                 std::thread::sleep(Duration::from_secs(1));
+                continue;
             }
+        };
+        if n < driver::OUTPUT_REPORT_SIZE {
+            // Driver currently always completes with the full size; guard
+            // anyway so a future short-write would be visible rather than
+            // silently shipping zeros.
+            eprintln!("\npend_output short: {n} bytes");
+            continue;
+        }
+
+        let Some(addr) = latest_src.lock().ok().and_then(|g| *g) else {
+            no_target += 1;
+            continue;
+        };
+        let target = SocketAddr::new(addr.ip(), DEFAULT_PORT);
+
+        let hdr = Header {
+            channel: Channel::Output,
+            sequence,
+            timestamp_us: now_us_low32(),
+        };
+        sequence = sequence.wrapping_add(1);
+
+        if wire::encode_header(&hdr, &mut wire_buf[..HEADER_LEN]).is_err()
+            || wire::encode_output(&buf, &mut wire_buf[HEADER_LEN..]).is_err()
+        {
+            send_errors += 1;
+            continue;
+        }
+        match send_sock.send_to(&wire_buf, target) {
+            Ok(_) => sent += 1,
+            Err(_) => send_errors += 1,
+        }
+
+        if last_log.elapsed() >= Duration::from_secs(2) {
+            last_log = Instant::now();
+            eprintln!(
+                "\noutput: sent={sent} senderr={send_errors} no_target={no_target} \
+                 last_msg_id=0x{:02x}",
+                buf[0],
+            );
         }
     }
+}
+
+/// Low 32 bits of wall-clock microseconds since Unix epoch.
+#[allow(clippy::cast_possible_truncation)]
+fn now_us_low32() -> u32 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_micros() as u32)
+        .unwrap_or(0)
 }

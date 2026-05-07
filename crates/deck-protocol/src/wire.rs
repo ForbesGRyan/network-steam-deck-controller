@@ -37,16 +37,15 @@
 //! 42..44   gyro.z           i16
 //! ```
 //!
-//! Output body (Windows → Deck, 6 bytes):
-//!
-//! ```text
-//! 0..2  left_magnitude   u16
-//! 2..4  right_magnitude  u16
-//! 4..6  duration_ms      u16
-//! ```
+//! Output body (Windows → Deck, 64 bytes): a raw Steam Deck feature report
+//! lifted verbatim from Steam's `SET_REPORT(FEATURE)` on the virtual device.
+//! Byte 0 is the Steam Controller `msg_id` (0xEA `TRIGGER_HAPTIC_CMD`, 0xEB
+//! `TRIGGER_RUMBLE_CMD`, 0x8F `TRIGGER_HAPTIC_PULSE`, ...). The Deck's
+//! hidraw interface speaks the same dialect, so the body is written
+//! through unchanged on the Deck side.
 
 use crate::buttons::Buttons;
-use crate::state::{ControllerState, RumbleCommand, Stick, Trackpad, Vec3i};
+use crate::state::{ControllerState, Stick, Trackpad, Vec3i};
 
 /// Magic bytes at the start of every packet. Catches misrouted traffic.
 pub const MAGIC: [u8; 4] = *b"NUSB";
@@ -60,8 +59,9 @@ pub const HEADER_LEN: usize = 16;
 /// Bytes in an [`Channel::Input`] body.
 pub const INPUT_BODY_LEN: usize = 44;
 
-/// Bytes in an [`Channel::Output`] body.
-pub const OUTPUT_BODY_LEN: usize = 6;
+/// Bytes in an [`Channel::Output`] body. Sized to one Steam Deck feature
+/// report — the same 64 bytes Steam writes via `SET_REPORT(FEATURE)`.
+pub const OUTPUT_BODY_LEN: usize = 64;
 
 /// Total bytes on the wire for an input packet.
 pub const INPUT_PACKET_LEN: usize = HEADER_LEN + INPUT_BODY_LEN;
@@ -277,39 +277,47 @@ pub fn decode_input(buf: &[u8]) -> Result<ControllerState, WireError> {
     })
 }
 
-/// Encode a [`RumbleCommand`] into the first 6 bytes of `out`.
+/// Encode a raw 64-byte Deck feature report into the first
+/// [`OUTPUT_BODY_LEN`] bytes of `out`.
 ///
 /// # Errors
-/// [`WireError::Short`] if `out.len() < OUTPUT_BODY_LEN`.
-pub fn encode_output(cmd: &RumbleCommand, out: &mut [u8]) -> Result<(), WireError> {
+/// [`WireError::Short`] if either side is shorter than [`OUTPUT_BODY_LEN`].
+pub fn encode_output(report: &[u8], out: &mut [u8]) -> Result<(), WireError> {
+    if report.len() < OUTPUT_BODY_LEN {
+        return Err(WireError::Short {
+            got: report.len(),
+            want: OUTPUT_BODY_LEN,
+        });
+    }
     if out.len() < OUTPUT_BODY_LEN {
         return Err(WireError::Short {
             got: out.len(),
             want: OUTPUT_BODY_LEN,
         });
     }
-    write_le_u16(out, 0, cmd.left_magnitude);
-    write_le_u16(out, 2, cmd.right_magnitude);
-    write_le_u16(out, 4, cmd.duration_ms);
+    out[..OUTPUT_BODY_LEN].copy_from_slice(&report[..OUTPUT_BODY_LEN]);
     Ok(())
 }
 
-/// Decode a [`RumbleCommand`] from the first 6 bytes of `buf`.
+/// Decode a raw 64-byte Deck feature report into `out`.
 ///
 /// # Errors
-/// [`WireError::Short`] if `buf.len() < OUTPUT_BODY_LEN`.
-pub fn decode_output(buf: &[u8]) -> Result<RumbleCommand, WireError> {
+/// [`WireError::Short`] if either side is shorter than [`OUTPUT_BODY_LEN`].
+pub fn decode_output(buf: &[u8], out: &mut [u8]) -> Result<(), WireError> {
     if buf.len() < OUTPUT_BODY_LEN {
         return Err(WireError::Short {
             got: buf.len(),
             want: OUTPUT_BODY_LEN,
         });
     }
-    Ok(RumbleCommand {
-        left_magnitude: read_le_u16(buf, 0),
-        right_magnitude: read_le_u16(buf, 2),
-        duration_ms: read_le_u16(buf, 4),
-    })
+    if out.len() < OUTPUT_BODY_LEN {
+        return Err(WireError::Short {
+            got: out.len(),
+            want: OUTPUT_BODY_LEN,
+        });
+    }
+    out[..OUTPUT_BODY_LEN].copy_from_slice(&buf[..OUTPUT_BODY_LEN]);
+    Ok(())
 }
 
 #[cfg(test)]
@@ -363,14 +371,15 @@ mod tests {
 
     #[test]
     fn output_body_roundtrip() {
-        let cmd = RumbleCommand {
-            left_magnitude: 32_000,
-            right_magnitude: 16_000,
-            duration_ms: 250,
-        };
+        let mut report = [0_u8; OUTPUT_BODY_LEN];
+        report[0] = 0xEB; // TRIGGER_RUMBLE_CMD
+        report[1] = 4;
+        report[2..6].copy_from_slice(&[0x00, 0x7D, 0x00, 0x3E]);
         let mut buf = [0_u8; OUTPUT_BODY_LEN];
-        encode_output(&cmd, &mut buf).unwrap();
-        assert_eq!(decode_output(&buf).unwrap(), cmd);
+        encode_output(&report, &mut buf).unwrap();
+        let mut decoded = [0_u8; OUTPUT_BODY_LEN];
+        decode_output(&buf, &mut decoded).unwrap();
+        assert_eq!(decoded, report);
     }
 
     #[test]
@@ -407,8 +416,12 @@ mod tests {
     #[test]
     fn rejects_short_buffer() {
         let buf = [0_u8; 4];
+        let mut out = [0_u8; OUTPUT_BODY_LEN];
         assert!(matches!(decode_header(&buf), Err(WireError::Short { .. })));
         assert!(matches!(decode_input(&buf), Err(WireError::Short { .. })));
-        assert!(matches!(decode_output(&buf), Err(WireError::Short { .. })));
+        assert!(matches!(
+            decode_output(&buf, &mut out),
+            Err(WireError::Short { .. })
+        ));
     }
 }

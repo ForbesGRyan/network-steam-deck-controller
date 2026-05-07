@@ -21,5 +21,5 @@ pub mod state;
 pub mod wire;
 
 pub use buttons::Buttons;
-pub use state::{ControllerState, RumbleCommand, Stick, Trackpad, Vec3i};
+pub use state::{ControllerState, Stick, Trackpad, Vec3i};
 pub use wire::{Channel, Header, WireError};

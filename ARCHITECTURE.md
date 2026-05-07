@@ -149,7 +149,19 @@ Signing path:
    The remaining piece of the original step 6 ("over the network") is
    blocked on a Hyper-V external-vSwitch UDP-drop issue with the Intel
    I225-V NIC; the protocol pipeline itself is validated.*
-7. Output path: rumble back to Deck.
+7. ✅ Output path: rumble back to Deck.
+   *`SET_REPORT(FEATURE)` payloads carrying the haptic/rumble msg_ids
+   (`0xEA TRIGGER_HAPTIC_CMD`, `0x8F TRIGGER_HAPTIC_PULSE`,
+   `0xEB TRIGGER_RUMBLE_CMD`) are forwarded from the kernel control
+   handler into a manual queue, picked up by user-mode via
+   `IOCTL_DECK_PEND_OUTPUT_REPORT`, sent over UDP to the Deck on the same
+   port we listen on, and applied via `HIDIOCSFEATURE` on `/dev/hidrawN`.
+   The wire `OUTPUT` body is a raw 64-byte feature report — Steam's bytes
+   pass through unmodified, since both ends speak the same dialect.
+   End-to-end validation requires (a) a real Deck running `server-deck`
+   with `O_RDWR` on the hidraw node, and (b) the network drop on the
+   Hyper-V external vSwitch resolved or the VM swapped for bare-metal
+   Windows.*
 8. Polish: reconnect, pairing, packaging.
 
 ## Pending validations
