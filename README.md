@@ -90,17 +90,25 @@ cargo test --workspace
    `devcon install root\NetworkDeckController` call needed to instantiate
    the root-enumerated PnP node. Uninstall via `driver\scripts\uninstall.ps1`.
 
-2. **Run the user-mode service.** Listens on UDP 49152 by default, attaches
-   to the kernel driver, parks an output IOCTL for rumble feedback. If the
-   driver isn't installed yet, runs in listen-only mode and reattaches the
-   moment it appears (`DriverHolder` retries every 5 s).
+2. **First-time pairing** (one-time): while `server-deck pair /dev/hidrawN`
+   is running on the Deck, run:
 
    ```powershell
-   .\target\release\client-win.exe 49152
-   # or with HMAC packet auth:
-   $env:NETWORK_DECK_KEY = "<64 hex chars>"
-   .\target\release\client-win.exe 49152
+   .\target\release\client-win.exe pair
    ```
+
+   Both sides print a short fingerprint. Confirm they match visibly on
+   both screens, then type `y` on each side. The trusted-peer state is
+   saved to `%LOCALAPPDATA%\network-deck\` automatically.
+
+3. **Normal run:**
+
+   ```powershell
+   .\target\release\client-win.exe
+   ```
+
+   The service binds UDP 49152, beacons on the LAN, and starts forwarding
+   packets the moment the Deck side replies.
 
    Useful test modes:
    - `client-win.exe --test` synthesizes alternating-A-button reports at
@@ -112,30 +120,41 @@ cargo test --workspace
 
 ### Deck side (Linux)
 
-```sh
-# One-time: udev rule so the deck user can read hidraw without sudo.
-sudo cp crates/server-deck/scripts/70-steam-deck.rules /etc/udev/rules.d/
-sudo udevadm control --reload && sudo udevadm trigger
+1. **One-time: udev rule** so the deck user can read hidraw without sudo:
 
-# Run server. Match port to client-win's listen port.
-./target/release/server-deck /dev/hidrawN <windows-ip>:49152
-```
+   ```sh
+   sudo cp crates/server-deck/scripts/70-steam-deck.rules /etc/udev/rules.d/
+   sudo udevadm control --reload && sudo udevadm trigger
+   ```
 
-For unattended setups, install the systemd unit:
+2. **First-time pairing** (one-time): while `client-win.exe pair` is
+   running on the PC, run:
 
-```sh
-sudo cp crates/server-deck/scripts/network-deck-server.service /etc/systemd/system/
-# Edit the Environment= lines for your hidraw path + Windows IP, then:
-sudo systemctl daemon-reload
-sudo systemctl enable --now network-deck-server.service
-```
+   ```sh
+   ./target/release/server-deck pair /dev/hidrawN
+   ```
 
-To enable HMAC packet auth, write the same hex key on both ends:
+   Confirm the printed fingerprints match on both screens, then accept on
+   each side. Trusted-peer state is saved automatically.
 
-```sh
-echo 'NETWORK_DECK_KEY=<64 hex chars>' | sudo tee /etc/network-deck.env
-sudo systemctl restart network-deck-server.service
-```
+3. **Normal run:**
+
+   ```sh
+   ./target/release/server-deck /dev/hidrawN
+   ```
+
+4. **systemd:** install the unit the same way as before:
+
+   ```sh
+   sudo cp crates/server-deck/scripts/network-deck-server.service /etc/systemd/system/
+   sudo systemctl daemon-reload
+   sudo systemctl enable --now network-deck-server.service
+   ```
+
+   The unit uses `--state-dir /var/lib/network-deck`. Pair once manually
+   (steps 1–2 above) before enabling the service, or stop the service,
+   run the `pair` subcommand with `--state-dir /var/lib/network-deck`, then
+   re-enable.
 
 ### What you'll see
 
@@ -156,6 +175,11 @@ gamepad-state frames. To get raw frames, kill Steam and unbind hid-steam:
 ```sh
 echo -n "<phys-id>" | sudo tee /sys/bus/hid/drivers/hid-steam/unbind
 ```
+
+**Troubleshooting:** If the status line stays at `peer: searching` after
+both sides are running, broadcasts may be filtered (guest VLAN, AP
+isolation). Try a wired connection or join both devices to the same SSID
+without isolation.
 
 ## What's left
 
@@ -178,6 +202,10 @@ Tracked in detail in [ARCHITECTURE.md](ARCHITECTURE.md#build-sequence):
    (driver/hidraw reopen on transient failure, optional HMAC-SHA256
    per-packet auth + 30 s replay window via `NETWORK_DECK_KEY`,
    PowerShell install scripts, systemd unit + udev rule)
+9. LAN discovery + first-time pairing — done.
+   (`pair` subcommand on each binary runs a 120 s mutual-confirm flow;
+   long-lived Ed25519 identities; HKDF-derived session key replaces the
+   removed `NETWORK_DECK_KEY` env var.)
 
 ## License
 
