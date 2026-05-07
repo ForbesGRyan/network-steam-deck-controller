@@ -119,13 +119,19 @@ Signing path:
    *Validated against real hardware; `BUTTON_MAP` confirmed for everything
    the Linux kernel driver covers. Capacitive thumbstick touch bits remain
    unknown and need a USB capture if/when they are wired up.*
-3. ⏳ Static UDE driver: hardcoded descriptors, canned report on a timer. Goal:
-   Steam shows "Steam Deck Controls." *Real descriptors landed in
-   `driver/src/usbdevice.cpp` — sourced from three public projects (see
-   memory `deck_descriptor_sources.md`). UDE bring-up bodies still stubbed
-   pending WDK install; the ten-step call sequence is documented inline at
-   the `UsbDeviceCreate` call site.*
-4. Feature-report path: lizard-mode disable, haptics-config ack.
+3. ✅ Static UDE driver: hardcoded descriptors. Steam shows "Steam Deck
+   Controls." *Verified in a Hyper-V Windows 11 VM (test-signed). Driver
+   loads, virtual USB device enumerates (5 interfaces, COM port for the
+   inert CDC ACM pair), HID class init completes, Steam Input opens the
+   device.*
+4. ✅ Feature-report path: lizard-mode disable + canned replies for the
+   Steam Controller request channel (set-then-get over feature reports).
+   *Steam recognizes the device as a Deck (`controller_neptune` config set
+   loaded). `EvtControlUrb` handles the open-sequence messages
+   `CLEAR_DIGITAL_MAPPINGS` / `SET_SETTINGS_VALUES` /
+   `GET_ATTRIBUTES_VALUES` / `GET_STRING_ATTRIBUTE`. Haptic / rumble
+   payloads are still discarded — that path lights up when step 7 wires
+   them through to user-mode.*
 5. User-mode IPC + live HID frames over IOCTL.
 6. Deck server reading hidraw → network → driver.
 7. Output path: rumble back to Deck.

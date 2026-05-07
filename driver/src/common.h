@@ -47,6 +47,14 @@ typedef struct _DEVICE_CONTEXT
     // for input report bytes; IOCTL_DECK_PUSH_INPUT_REPORT pulls it and
     // completes it with the user-mode-supplied buffer.
     WDFQUEUE             GamepadInQueue;
+
+    // Last canned feature-report response. The Steam Controller HID
+    // protocol is request/reply over feature reports: host sends
+    // SET_REPORT(FEATURE) with [msg_id, len, ...args] then immediately
+    // GET_REPORT(FEATURE) and parses the reply [msg_id, len, ...response].
+    // We populate this buffer in the SET handler and serve it from GET.
+    // 64 bytes = DECK_OUTPUT_REPORT_SIZE = real Deck feature-report size.
+    UCHAR                LastFeatureResponse[DECK_OUTPUT_REPORT_SIZE];
 } DEVICE_CONTEXT, *PDEVICE_CONTEXT;
 
 WDF_DECLARE_CONTEXT_TYPE_WITH_NAME(DEVICE_CONTEXT, DeviceGetContext)

@@ -99,8 +99,9 @@ Tracked in detail in [ARCHITECTURE.md](ARCHITECTURE.md#build-sequence):
 1. Lift Deck HID layout into `deck-protocol`. — done
 2. Hidraw spike: validate `BUTTON_MAP` against real hardware. — done
 3. Static UDE driver: descriptors, plug-in flow, "Steam Deck Controls"
-   appears in Steam. — descriptors landed, bring-up bodies pending
-   WDK install
+   appears in Steam. — done (Hyper-V VM with test signing)
+4. Feature-report path: lizard-mode disable, haptics-config ack. — done
+   (Steam recognizes as Deck, `controller_neptune` config loads)
 4. Feature-report path (lizard-mode disable, haptics-config ack).
 5. User-mode IPC + live HID frames over IOCTL.
 6. Deck server → network → driver end-to-end.

@@ -223,6 +223,122 @@ VOID EvtUsbEndpointReset(_In_ UDECXUSBENDPOINT, _In_ WDFREQUEST Request)
 #define HID_REQUEST_SET_IDLE            0x0A
 #define HID_REQUEST_SET_PROTOCOL        0x0B
 
+#define HID_REPORT_TYPE_INPUT           0x01
+#define HID_REPORT_TYPE_OUTPUT          0x02
+#define HID_REPORT_TYPE_FEATURE         0x03
+
+// ---------------------------------------------------------------------------
+// Steam Controller feature-report message IDs (subset we care about).
+// Source: tools/reference/hid-steam.c (Linux kernel, kernel-sourced) and
+// libsdl-org/SDL src/joystick/hidapi/steam/controller_constants.h.
+// ---------------------------------------------------------------------------
+#define DECK_MSG_CLEAR_DIGITAL_MAPPINGS   0x81
+#define DECK_MSG_GET_ATTRIBUTES_VALUES    0x83
+#define DECK_MSG_SET_DEFAULT_DIGITAL_MAPPINGS 0x85
+#define DECK_MSG_SET_SETTINGS_VALUES      0x87
+#define DECK_MSG_LOAD_DEFAULT_SETTINGS    0x8E
+#define DECK_MSG_TRIGGER_HAPTIC_PULSE     0x8F
+#define DECK_MSG_GET_DEVICE_INFO          0xA1
+#define DECK_MSG_GET_STRING_ATTRIBUTE     0xAE
+#define DECK_MSG_TRIGGER_HAPTIC_CMD       0xEA
+#define DECK_MSG_TRIGGER_RUMBLE_CMD       0xEB
+
+// String-attribute selectors carried in the args of GET_STRING_ATTRIBUTE.
+#define DECK_ATTRIB_STR_BOARD_SERIAL      0x00
+#define DECK_ATTRIB_STR_UNIT_SERIAL       0x01
+
+// Numeric attribute selectors returned by GET_ATTRIBUTES_VALUES.
+#define DECK_ATTRIB_UNIQUE_ID             0x00
+#define DECK_ATTRIB_PRODUCT_ID            0x01
+#define DECK_ATTRIB_CAPABILITIES          0x02
+#define DECK_ATTRIB_FIRMWARE_BUILD_TIME   0x04
+#define DECK_ATTRIB_BOARD_REVISION        0x09
+#define DECK_ATTRIB_BOOTLOADER_BUILD_TIME 0x0A
+
+// ---------------------------------------------------------------------------
+// Build a canned 64-byte feature-report reply for `msgId` into `out`.
+//
+// The Steam Controller protocol is set-then-get over feature reports: host
+// SETs a request [msg_id, len, ...args], then GETs the reply [msg_id, len,
+// ...response]. Steam parses the reply by checking out[0] == msg_id, then
+// walking the payload according to the message's known schema.
+//
+// For step 4 (recognition) we satisfy the messages Steam fires during open:
+//
+//   - CLEAR_DIGITAL_MAPPINGS  : ack-only (echo with len=0)
+//   - LOAD_DEFAULT_SETTINGS    : ack-only
+//   - SET_SETTINGS_VALUES      : ack-only
+//   - GET_ATTRIBUTES_VALUES    : return one fake attribute (PRODUCT_ID = 0x1205)
+//                                so Steam's parser advances past the read
+//                                without erroring out
+//   - GET_STRING_ATTRIBUTE     : if asked for UNIT_SERIAL, return our serial
+//                                string ("MEDA00000001")
+//   - everything else          : ack-only
+// ---------------------------------------------------------------------------
+static VOID
+BuildFeatureResponse(_In_reads_bytes_(DECK_OUTPUT_REPORT_SIZE) const UCHAR *request,
+                     _In_ ULONG  requestLen,
+                     _Out_writes_bytes_all_(DECK_OUTPUT_REPORT_SIZE) UCHAR *out)
+{
+    RtlZeroMemory(out, DECK_OUTPUT_REPORT_SIZE);
+
+    if (requestLen < 2) {
+        return;
+    }
+
+    const UCHAR  msgId = request[0];
+    const UCHAR  argLen = request[1];
+    const UCHAR *args = request + 2;
+    const ULONG  argsAvail = (requestLen >= 2) ? (requestLen - 2) : 0;
+
+    out[0] = msgId;
+    out[1] = 0;  // overwritten below for messages that return a payload
+
+    switch (msgId) {
+    case DECK_MSG_GET_ATTRIBUTES_VALUES: {
+        // Reply schema: [0x83, len, (attr_id:1, value:4) * N]
+        // Returning a single PRODUCT_ID attribute is enough for Steam's
+        // GetControllerInfo work item to advance — it parses opportunistically.
+        out[1] = 5;
+        out[2] = DECK_ATTRIB_PRODUCT_ID;
+        out[3] = 0x05;          // 0x00001205 little-endian
+        out[4] = 0x12;
+        out[5] = 0x00;
+        out[6] = 0x00;
+        break;
+    }
+
+    case DECK_MSG_GET_STRING_ATTRIBUTE: {
+        // Reply schema: [0xAE, len, attr_id, ...ASCII...]
+        if (argLen >= 1 && argsAvail >= 1 && args[0] == DECK_ATTRIB_STR_UNIT_SERIAL) {
+            static const CHAR serial[] = "MEDA00000001";
+            const UCHAR slen = static_cast<UCHAR>(sizeof(serial) - 1);  // sans NUL
+            out[1] = static_cast<UCHAR>(slen + 1);  // attr_id + string bytes
+            out[2] = DECK_ATTRIB_STR_UNIT_SERIAL;
+            RtlCopyMemory(out + 3, serial, slen);
+        } else {
+            // Unknown string attribute — empty payload.
+            out[1] = 0;
+        }
+        break;
+    }
+
+    case DECK_MSG_GET_DEVICE_INFO:
+    case DECK_MSG_CLEAR_DIGITAL_MAPPINGS:
+    case DECK_MSG_SET_DEFAULT_DIGITAL_MAPPINGS:
+    case DECK_MSG_SET_SETTINGS_VALUES:
+    case DECK_MSG_LOAD_DEFAULT_SETTINGS:
+    case DECK_MSG_TRIGGER_HAPTIC_PULSE:
+    case DECK_MSG_TRIGGER_HAPTIC_CMD:
+    case DECK_MSG_TRIGGER_RUMBLE_CMD:
+    default:
+        // Ack-only: echo msg_id with zero-length payload.
+        // TODO: route haptic/rumble payloads to PendedOutputQueue so
+        // user-mode can ship them back to the Deck.
+        break;
+    }
+}
+
 EVT_WDF_IO_QUEUE_IO_INTERNAL_DEVICE_CONTROL EvtControlUrb;
 
 VOID
@@ -306,15 +422,28 @@ EvtControlUrb(_In_ WDFQUEUE Queue,
 
     // ------- HID class requests to interface -------
     else if (type == BMREQUEST_CLASS && recipient == BMREQUEST_TO_INTERFACE) {
+        PDEVICE_CONTEXT ctx = DeviceGetContext(WdfIoQueueGetDevice(Queue));
+        const UCHAR reportType = static_cast<UCHAR>(wValue >> 8);
+
         switch (bRequest) {
         case HID_REQUEST_SET_IDLE:
         case HID_REQUEST_SET_PROTOCOL:
+            // Plain ack — Microsoft HID class driver fires these during init.
+            status = STATUS_SUCCESS;
+            break;
+
         case HID_REQUEST_SET_REPORT:
-            // Host -> device, no payload to return. Acknowledge.
+            // Feature reports on IF2 are the Steam Controller request channel
+            // (set-then-get pattern). Build the corresponding canned reply
+            // and stash it for the next GET_REPORT.
             //
-            // SET_REPORT(FEATURE/OUTPUT) on IF2 is the haptics/rumble path.
-            // TODO: route the payload to PendedOutputQueue so user-mode
-            // (client-win) can ship rumble back to the Deck.
+            // TODO: when the request is a haptic / rumble command
+            // (DECK_MSG_TRIGGER_HAPTIC_CMD/PULSE/RUMBLE), forward the args
+            // to PendedOutputQueue so user-mode can ship rumble back to
+            // the Deck.
+            if (reportType == HID_REPORT_TYPE_FEATURE && buffer != nullptr) {
+                BuildFeatureResponse(buffer, bufferLength, ctx->LastFeatureResponse);
+            }
             status = STATUS_SUCCESS;
             break;
 
@@ -331,13 +460,29 @@ EvtControlUrb(_In_ WDFQUEUE Queue,
             break;
 
         case HID_REQUEST_GET_REPORT:
-            // Return a buffer of zeros. Real input/feature reports come
-            // through the interrupt-IN endpoint (input) or via specific
-            // user-mode-mediated handlers (feature).
-            if (buffer != nullptr && bufferLength >= wLength) {
-                RtlZeroMemory(buffer, wLength);
-                bytesCompleted = wLength;
-                status = STATUS_SUCCESS;
+            // Feature reads return the canned response built during the
+            // preceding SET_REPORT. Input/Output reads return zeros — input
+            // flows over the interrupt-IN endpoint instead.
+            if (buffer != nullptr) {
+                if (reportType == HID_REPORT_TYPE_FEATURE) {
+                    const ULONG copyLen =
+                        (wLength < DECK_OUTPUT_REPORT_SIZE) ? wLength : DECK_OUTPUT_REPORT_SIZE;
+                    if (bufferLength >= copyLen) {
+                        RtlCopyMemory(buffer, ctx->LastFeatureResponse, copyLen);
+                        bytesCompleted = copyLen;
+                        status = STATUS_SUCCESS;
+                    } else {
+                        status = STATUS_BUFFER_TOO_SMALL;
+                    }
+                } else {
+                    if (bufferLength >= wLength) {
+                        RtlZeroMemory(buffer, wLength);
+                        bytesCompleted = wLength;
+                        status = STATUS_SUCCESS;
+                    } else {
+                        status = STATUS_BUFFER_TOO_SMALL;
+                    }
+                }
             } else {
                 status = STATUS_BUFFER_TOO_SMALL;
             }
