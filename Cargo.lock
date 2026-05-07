@@ -46,6 +46,7 @@ name = "client-win"
 version = "0.1.0"
 dependencies = [
  "deck-protocol",
+ "discovery",
  "windows-sys",
 ]
 
@@ -476,6 +477,7 @@ name = "server-deck"
 version = "0.1.0"
 dependencies = [
  "deck-protocol",
+ "discovery",
  "libc",
 ]
 
