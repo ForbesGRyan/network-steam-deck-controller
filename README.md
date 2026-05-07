@@ -104,6 +104,9 @@ Tracked in detail in [ARCHITECTURE.md](ARCHITECTURE.md#build-sequence):
    (Steam recognizes as Deck, `controller_neptune` config loads)
 5. User-mode IPC + live HID frames over IOCTL. — done
    (`client-win --test` toggles the A button visible in Steam at 1 Hz)
+6. Real Deck bytes → driver → Steam (protocol). — done
+   (replayed 1249 captured frames via `client-win --replay`, button
+   transitions show in Steam Controller Layout)
 4. Feature-report path (lizard-mode disable, haptics-config ack).
 5. User-mode IPC + live HID frames over IOCTL.
 6. Deck server → network → driver end-to-end.

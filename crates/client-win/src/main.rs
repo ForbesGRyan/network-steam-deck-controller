@@ -11,12 +11,19 @@
 //! HID-encode path still executes as a self-test of the protocol crate).
 //!
 //! Usage:
-//!   client-win [port]   - listen on UDP `port` for Deck input packets
-//!                         (default 49152)
-//!   client-win --test   - drive the IOCTL with a canned state pattern
-//!                         (alternates neutral / A pressed each second).
-//!                         Useful for end-to-end driver bring-up
-//!                         without a real Deck server attached.
+//!   client-win [port]            - listen on UDP `port` for Deck input
+//!                                  packets (default 49152)
+//!   client-win --test            - drive the IOCTL with a canned state
+//!                                  pattern (alternates neutral / A
+//!                                  pressed each second). Useful for
+//!                                  end-to-end driver bring-up without a
+//!                                  real Deck server attached.
+//!   client-win --replay <path>   - replay a hidraw capture file
+//!                                  recorded on a Deck (e.g.
+//!                                  `cat /dev/hidrawN > deck.bin`).
+//!                                  Reads 60-byte reports, pads to 64,
+//!                                  pushes via IOCTL at ~250 Hz. Loops
+//!                                  forever.
 
 use std::io::Write;
 use std::net::{Ipv4Addr, SocketAddr, UdpSocket};
@@ -47,9 +54,18 @@ struct Stats {
 }
 
 fn main() {
-    let arg = std::env::args().nth(1);
+    let mut args = std::env::args().skip(1);
+    let arg = args.next();
     if matches!(arg.as_deref(), Some("--test")) {
         run_test_mode();
+        return;
+    }
+    if matches!(arg.as_deref(), Some("--replay")) {
+        let Some(path) = args.next() else {
+            eprintln!("usage: client-win --replay <path-to-hidraw-capture>");
+            std::process::exit(2);
+        };
+        run_replay_mode(&path);
         return;
     }
 
@@ -79,17 +95,50 @@ fn main() {
     // zero tail so the trailing 4 bytes match what real Deck firmware sends.
     let mut hid_buf = [0_u8; driver::INPUT_REPORT_SIZE];
     let mut last_print = Instant::now();
+    let mut last_recv_log = Instant::now();
     let mut stdout = std::io::stdout();
+    let mut idle_since = Instant::now();
+    let mut idle_logged = false;
+    let mut total_received: u64 = 0;
+    let mut total_recv_bytes: u64 = 0;
+    let mut first_pkt_logged = false;
 
     loop {
         let n = match sock.recv_from(&mut buf) {
-            Ok((n, _src)) => n,
+            Ok((n, src)) => {
+                total_received += 1;
+                total_recv_bytes += n as u64;
+                idle_since = Instant::now();
+                idle_logged = false;
+                if !first_pkt_logged {
+                    eprintln!(
+                        "\nfirst UDP packet: {n} bytes from {src} \
+                         (will print one-time per-source log every 2 s)"
+                    );
+                    first_pkt_logged = true;
+                }
+                if last_recv_log.elapsed() >= Duration::from_secs(2) {
+                    last_recv_log = Instant::now();
+                    eprintln!(
+                        "\nrecv heartbeat: total_pkts={total_received} bytes={total_recv_bytes} \
+                         last_src={src} last_size={n}"
+                    );
+                }
+                n
+            }
             Err(e)
                 if matches!(
                     e.kind(),
                     std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock
                 ) =>
             {
+                if !idle_logged && idle_since.elapsed() >= Duration::from_secs(5) {
+                    eprintln!(
+                        "\nidle: no UDP for 5 s. total_pkts={total_received} \
+                         (sock {bind})"
+                    );
+                    idle_logged = true;
+                }
                 continue;
             }
             Err(e) => {
@@ -271,6 +320,98 @@ fn run_test_mode() {
 #[cfg(not(windows))]
 fn run_test_mode() {
     eprintln!("--test mode requires Windows (driver IPC); exiting");
+    std::process::exit(1);
+}
+
+/// Replay a hidraw capture file (raw concatenated 60-byte Deck HID input
+/// reports — what `cat /dev/hidrawN` produces on the Deck) through the
+/// driver IOCTL. Each report is padded to 64 bytes, then pushed at ~250 Hz
+/// to match real-Deck cadence. Loops forever so a few seconds of capture
+/// makes a long-lived test session.
+#[cfg(windows)]
+fn run_replay_mode(path: &str) {
+    let driver = match driver::DeckDriver::open() {
+        Ok(d) => d,
+        Err(e) => {
+            eprintln!("driver: not available ({e}); replay mode requires the driver");
+            std::process::exit(1);
+        }
+    };
+    eprintln!("driver: opened (replay mode — {path} @ ~250 Hz, looping)");
+
+    let raw = match std::fs::read(path) {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("read {path}: {e}");
+            std::process::exit(1);
+        }
+    };
+    if raw.len() < hid::REPORT_LEN {
+        eprintln!(
+            "{path}: only {} bytes; need at least {} for one Deck report",
+            raw.len(),
+            hid::REPORT_LEN,
+        );
+        std::process::exit(1);
+    }
+    let frames = raw.len() / hid::REPORT_LEN;
+    eprintln!(
+        "loaded {} bytes ({frames} reports of {} bytes each)",
+        raw.len(),
+        hid::REPORT_LEN,
+    );
+
+    let mut hid_buf = [0_u8; driver::INPUT_REPORT_SIZE];
+    let push_period = Duration::from_millis(4);
+    let mut last_print = Instant::now();
+    let mut pushed: u64 = 0;
+    let mut errors: u64 = 0;
+    let mut stdout = std::io::stdout();
+
+    let mut skipped: u64 = 0;
+    loop {
+        for chunk in raw.chunks_exact(hid::REPORT_LEN) {
+            // Skip non-deck-state reports (status / wireless / debug) that
+            // the firmware interleaves into the hidraw stream. Only frames
+            // that parse to a ControllerState get pushed; otherwise Steam
+            // sees garbage button bytes and the controller appears stuck.
+            let parsed: [u8; hid::REPORT_LEN] = match chunk.try_into() {
+                Ok(arr) => arr,
+                Err(_) => { skipped += 1; continue; }
+            };
+            if hid::parse_input_report(&parsed).is_err() {
+                skipped += 1;
+                continue;
+            }
+
+            // Padding tail stays zero — matches what the real Deck firmware
+            // sends on its 64-byte interrupt-IN endpoint.
+            hid_buf[..hid::REPORT_LEN].copy_from_slice(chunk);
+            for b in &mut hid_buf[hid::REPORT_LEN..] { *b = 0; }
+
+            match driver.push_input(&hid_buf) {
+                Ok(()) => pushed += 1,
+                Err(_) => errors += 1,
+            }
+
+            if last_print.elapsed() >= PRINT_EVERY {
+                last_print = Instant::now();
+                let _ = write!(
+                    stdout,
+                    "\x1b[2K\rpushed={pushed:>8} skipped={skipped:>6} err={errors:>4} \
+                     frames_in_file={frames}",
+                );
+                let _ = stdout.flush();
+            }
+
+            std::thread::sleep(push_period);
+        }
+    }
+}
+
+#[cfg(not(windows))]
+fn run_replay_mode(_path: &str) {
+    eprintln!("--replay mode requires Windows (driver IPC); exiting");
     std::process::exit(1);
 }
 

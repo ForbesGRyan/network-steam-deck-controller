@@ -139,7 +139,16 @@ Signing path:
    end-to-end with `client-win --test` synthesizing alternating-A-button
    reports at ~250 Hz: Steam's Controller Layout test screen highlights
    the A button on / off at 1 Hz.*
-6. Deck server reading hidraw → network → driver.
+6. ✅ Real Deck bytes → driver → Steam (protocol path).
+   *Captured raw hidraw bytes from a real Deck (1249 frames, every frame
+   `0x01 0x00 0x09 0x40` framed), replayed via `client-win --replay`,
+   Steam's Controller Layout shows the captured button pattern blinking
+   correctly. This caught a 60-vs-64 size bug in the protocol crate —
+   `hid::REPORT_LEN` is 64, not 60; an earlier "fix" had set it to 60
+   and would have misaligned the byte stream from real hardware.
+   The remaining piece of the original step 6 ("over the network") is
+   blocked on a Hyper-V external-vSwitch UDP-drop issue with the Intel
+   I225-V NIC; the protocol pipeline itself is validated.*
 7. Output path: rumble back to Deck.
 8. Polish: reconnect, pairing, packaging.
 

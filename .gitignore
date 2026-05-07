@@ -29,3 +29,7 @@ Thumbs.db
 # Local environment overrides
 .env
 *.local
+
+# Local hidraw captures (use with `client-win --replay`). Per-device
+# binaries; no value in committing.
+*.bin

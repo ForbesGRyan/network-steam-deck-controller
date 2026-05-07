@@ -15,7 +15,7 @@
 //! 4..N : payload -> meaning depends on `type`
 //! ```
 //!
-//! For Deck input (`type == 0x09`) the 60-byte buffer holds:
+//! For Deck input (`type == 0x09`) the 64-byte buffer holds:
 //!
 //! ```text
 //! 4..8   u32   sequence number
@@ -54,17 +54,27 @@ pub const PID_STEAM_CONTROLLER: u16 = 0x1102;
 /// Steam Controller wireless dongle PID. Reference only.
 pub const PID_STEAM_CONTROLLER_WIRELESS: u16 = 0x1142;
 
-/// Length of a Deck input report on the wire: 4-byte framing header
-/// (`0x01 0x00 type len`) plus the [`DECK_PAYLOAD_LEN`]-byte payload.
-pub const REPORT_LEN: usize = 4 + DECK_PAYLOAD_LEN as usize;
+/// Length of a Deck input report on the wire: 64 bytes total (4-byte
+/// framing header `0x01 0x00 type len` + 60-byte payload).
+///
+/// This was confirmed against a real Steam Deck capture
+/// (`deck-buttons.bin`): file size is an exact multiple of 64, every
+/// frame at 64-byte alignment has the framing `0x01 0x00 0x09 0x40`.
+/// Earlier the codec used 60-byte reports (matching what the Linux
+/// kernel `hid-steam.c` parses out of `payload`), but that misaligns
+/// the actual hidraw byte stream.
+pub const REPORT_LEN: usize = 64;
 
 /// Always-on framing prefix at byte 0.
 pub const FRAME_PREFIX_0: u8 = 0x01;
 /// Always-on framing prefix at byte 1.
 pub const FRAME_PREFIX_1: u8 = 0x00;
 
-/// Payload length the Deck reports for its input frames (byte 3).
-pub const DECK_PAYLOAD_LEN: u8 = 56;
+/// Value of byte 3 of every Deck input report. Confirmed from real
+/// hardware: 0x40 (64), the total report length including the 4-byte
+/// header. Per-firmware variation possible — use `accept_payload_len`
+/// in the parser to be permissive if that turns out to matter.
+pub const DECK_PAYLOAD_LEN: u8 = 0x40;
 
 /// Report type values (byte 2 of every report).
 pub mod report_type {
