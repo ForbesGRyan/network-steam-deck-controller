@@ -33,11 +33,14 @@ alternative and why this design was chosen.
 crates/
   discovery/      Ed25519 identity, signed-UDP beacon, trust file, pair flow
   server-deck/    Linux binary: sysfs busid lookup + usbip bind state machine
+  kiosk-deck/     Linux GUI: fullscreen touch UI for pause/resume on the Deck
   client-win/     Windows binary: tray app + usbip.exe attach state machine
 scripts/
-  install-deck.sh          Deck-side installer (pacman + systemd)
-  install-windows.ps1      Windows-side installer (usbip-win2 + binary drop)
-ARCHITECTURE.md   design history, component diagram, open risks
+  install-deck.sh                Deck-side installer (pacman + systemd + kiosk)
+  install-windows.ps1            Windows-side installer (usbip-win2 + binary drop)
+  network-deck.tmpfiles          Creates /run/network-deck/ at boot (kiosk IPC)
+  network-deck-kiosk.desktop     XDG entry for the kiosk app
+ARCHITECTURE.md   design history, component diagram, wire+IPC contracts, open risks
 ```
 
 ## Build
@@ -54,6 +57,7 @@ Per-binary platform support:
 | Binary | Real platform | Other platforms |
 |---|---|---|
 | `server-deck` | Linux (shells out to `usbip`) | builds, exits with "Linux only" |
+| `kiosk-deck` (`network-deck-kiosk`) | Linux (eframe/egui, X11 or Wayland) | builds, exits with "Linux only" |
 | `client-win` | Windows (shells out to `usbip.exe`, Win32 tray) | builds, no-ops tray calls |
 
 ## Install
@@ -125,6 +129,12 @@ the next game session will pick up without manual intervention.
 **vhci not available after suspend:** run `.\scripts\install-windows.ps1`
 again (idempotent) or restart the usbip-win2 service; the tray's attach
 state machine will reconnect once the driver is ready.
+
+**Kiosk shows "Daemon not running":** the kiosk reads
+`/run/network-deck/status.json`, which is populated by `server-deck`.
+Check `systemctl status network-deck-server.service` and that
+`/run/network-deck/` exists (created at boot via the tmpfiles entry; if
+not, run `sudo systemd-tmpfiles --create /etc/tmpfiles.d/network-deck.conf`).
 
 ## License
 

@@ -22,6 +22,15 @@ full-duplex (rumble flows back to the Deck).
 
 Decision history (most recent first):
 
+- **2026-05-08** — Added a Deck-side kiosk UI (`crates/kiosk-deck`, `eframe`/
+  `egui` fullscreen app) so the user can pause/resume controller sharing
+  from the touchscreen while a Windows game is using the controller. The
+  daemon and kiosk talk through a shared dir `/run/network-deck/` (mode
+  0777, single-user device): daemon writes `status.json` each tick,
+  kiosk creates/removes a `paused` flag file. Pause is implemented as
+  "treat peer as absent" in the daemon's tick — the bind/unbind state
+  machine is unchanged. Steam library entry is added once via the
+  desktop client (no `shortcuts.vdf` munging).
 - **2026-05-07** — Pivot to usbip backend after a hardware test confirmed
   `usbipd` + `usbip-win2 v0.9.7.7` produces a Deck that Steam recognizes
   and works in-game with no custom driver. The previous reason to reject
@@ -47,6 +56,13 @@ Decision history (most recent first):
 |   - sysfs lookup of Deck controller busid            |
 |   - signed-UDP discovery beacon                      |
 |   - bind/unbind state machine (shells out to usbip)  |
+|   - publishes Status + reads paused flag             |
+|         via /run/network-deck/                       |
+|                                                      |
+| kiosk-deck (Rust, eframe/egui) — fullscreen touch UI |
+|   - reads /run/network-deck/status.json (4 Hz)       |
+|   - creates/removes /run/network-deck/paused on tap  |
+|   - launched via Steam library "Add Non-Steam Game"  |
 +----------------------|-------------------------------+
                        |
                        | UDP 49152: discovery beacon (signed)
@@ -70,7 +86,12 @@ Decision history (most recent first):
   pair flow. Shared between Deck server and Windows client. No I/O
   beyond UDP + filesystem.
 - `crates/server-deck/` — Linux binary. Drives `usbip bind` based on
-  beacon state.
+  beacon state. Publishes daemon view via `/run/network-deck/status.json`
+  and respects `/run/network-deck/paused`.
+- `crates/kiosk-deck/` — Linux GUI binary (`eframe`/`egui`). Fullscreen
+  touch-screen app for pausing/resuming controller sharing. Reads
+  `status.json`; toggles the `paused` flag on tap. Launched via Steam
+  library as a non-Steam game.
 - `crates/client-win/` — Windows binary. Tray app that drives
   `usbip.exe attach` based on beacon state.
 - `scripts/install-deck.sh` — Deck-side installer (pacman + systemd).
@@ -79,7 +100,7 @@ Decision history (most recent first):
 
 ## Wire protocol
 
-Two channels:
+Two network channels plus one local-IPC contract:
 
 - **Discovery (UDP 49152, broadcast):** signed beacon every 1 s; magic
   `NDB1`. Receiver verifies Ed25519 signature against the trusted-peer
@@ -87,6 +108,13 @@ Two channels:
   address to the data plane.
 - **USB/IP (TCP 3240):** stock Linux `usbipd` ↔ `usbip-win2` vhci. We
   don't speak this directly; we just drive the lifecycle.
+- **Deck-local IPC (`/run/network-deck/`, mode 0777):** the daemon is
+  the sole writer of `status.json` (atomic tmp+rename, ~2 Hz) — fields
+  `peer_name`, `peer_present` (raw beacon presence), `bound`, `paused`.
+  The kiosk is the sole writer of the `paused` flag file (touch =
+  paused, remove = resumed). The JSON shape is the contract; the struct
+  is intentionally duplicated across `server-deck` and `kiosk-deck` so
+  there is no shared library crate solely to hold it.
 
 ## Pair flow
 
@@ -122,3 +150,5 @@ The current shape:
 3. ✅ Windows-side `client-win` rewritten around `usbip.exe attach` and
    a tray app (Phase B of same plan).
 4. ✅ Cleanup: custom driver tree and `deck-protocol` deleted (Phase C).
+5. ✅ Deck-side touchscreen kiosk added for pause/resume control (plan
+   `docs/superpowers/plans/2026-05-08-deck-kiosk-ui.md`).
