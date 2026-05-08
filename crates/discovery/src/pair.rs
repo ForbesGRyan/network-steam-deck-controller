@@ -326,7 +326,7 @@ fn sender_loop(ctx: &SendCtx, state: &Arc<SendState>) {
         if now >= next {
             let flags = state.flags.load(Ordering::Relaxed);
             let peer_fpr = if flags & FLAG_ACCEPT != 0 {
-                state.peer_fpr.lock().map(|g| *g).unwrap_or([0; FPR_LEN])
+                state.peer_fpr.lock().map_or([0; FPR_LEN], |g| *g)
             } else {
                 [0; FPR_LEN]
             };
