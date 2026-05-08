@@ -43,6 +43,12 @@ if [[ ! -f "$BIN_SRC" ]]; then
     exit 1
 fi
 
+KIOSK_SRC="$SCRIPT_DIR/../target/release/network-deck-kiosk"
+if [[ ! -f "$KIOSK_SRC" ]]; then
+    echo "Build the release binary first: cargo build --release -p kiosk-deck" >&2
+    exit 1
+fi
+
 echo ">> Installing /usr/local/bin/server-deck..."
 install -m 755 "$BIN_SRC" /usr/local/bin/server-deck
 
@@ -50,12 +56,6 @@ UNIT_SRC="$SCRIPT_DIR/../crates/server-deck/scripts/network-deck-server.service"
 echo ">> Installing systemd unit..."
 install -m 644 "$UNIT_SRC" /etc/systemd/system/network-deck-server.service
 systemctl daemon-reload
-
-KIOSK_SRC="$SCRIPT_DIR/../target/release/network-deck-kiosk"
-if [[ ! -f "$KIOSK_SRC" ]]; then
-    echo "Build the release binary first: cargo build --release -p kiosk-deck" >&2
-    exit 1
-fi
 
 echo ">> Installing /usr/local/bin/network-deck-kiosk..."
 install -m 755 "$KIOSK_SRC" /usr/local/bin/network-deck-kiosk
