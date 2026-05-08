@@ -101,14 +101,34 @@ impl PairWorker {
 
 impl Drop for PairWorker {
     fn drop(&mut self) {
-        // If the worker is still parked at a prompt, send Reject so it
-        // unwinds. The bound socket drops with `cfg`, ending Phase 1 sends.
+        // If the worker is parked at a prompt, Reject lets it unwind right
+        // away. If it's in Phase 1 (recv loop), the recv socket has a
+        // 200 ms read timeout and the timeout itself is bounded — so the
+        // worker exits at worst after `cfg.timeout`. We can't wait that
+        // long on the GUI thread, so we hand the join off to a short-lived
+        // reaper and return immediately.
         let _ = self.decision_tx.try_send(Decision::Reject);
-        if let Some(handle) = self.handle.take() {
-            // Don't block the GUI thread for long — give the worker a
-            // second to exit, then detach.
-            let _ = handle.join();
+        let Some(handle) = self.handle.take() else { return };
+        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(200);
+        loop {
+            if handle.is_finished() {
+                let _ = handle.join();
+                return;
+            }
+            if std::time::Instant::now() >= deadline {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
         }
+        // Worker still alive — detach the join into a reaper so the GUI
+        // thread isn't blocked. The reaper holds the handle until the
+        // worker eventually exits (capped by `PairConfig.timeout`, 120 s).
+        std::thread::Builder::new()
+            .name("pair-reaper".into())
+            .spawn(move || {
+                let _ = handle.join();
+            })
+            .ok();
     }
 }
 

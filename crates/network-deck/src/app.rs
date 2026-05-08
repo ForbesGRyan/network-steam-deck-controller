@@ -487,10 +487,10 @@ impl KioskApp {
                     ui.add_space(8.0);
                     ui.label(
                         egui::RichText::new(
-                            "Restart re-execs the installed binary directly (relies on the\n\
-                             setuid bit set during install).\n\
-                             Run with password falls back to `pkexec` if the setuid bit was\n\
-                             stripped (mount option, manual chmod, etc.).",
+                            "Restart re-runs `sudo -n` (relies on the NOPASSWD sudoers\n\
+                             entry written during install).\n\
+                             Run with password falls back to `pkexec` if the sudoers entry\n\
+                             is missing or sudo refuses to run non-interactively.",
                         )
                         .size(13.0),
                     );
@@ -499,7 +499,7 @@ impl KioskApp {
         });
 
         if intent_retry {
-            self.respawn_daemon(Escalation::Direct);
+            self.respawn_daemon(Escalation::SudoNonInteractive);
         }
         if intent_pkexec {
             self.respawn_daemon(Escalation::Pkexec);
@@ -599,10 +599,35 @@ fn spawn_installer(self_exe: &std::path::Path) -> std::io::Result<Child> {
     // pkexec triggers the polkit auth agent (graphical password prompt on KDE
     // / GNOME / Steam Deck Desktop Mode). The child re-execs us with `install`,
     // which contains the real bootstrap logic.
-    std::process::Command::new("pkexec")
-        .arg(self_exe)
+    //
+    // Pin self_exe to a system-owned path before elevating: pkexec runs the
+    // target as root, so a user-writable path here is a one-step root.
+    let canonical = self_exe.canonicalize().unwrap_or_else(|_| self_exe.to_path_buf());
+    if !is_safe_install_source(&canonical) {
+        return Err(std::io::Error::other(format!(
+            "refusing to pkexec a binary outside the system tree: {}\n\
+             re-run from {} or anywhere under /usr/.",
+            canonical.display(),
+            crate::install::INSTALL_BIN,
+        )));
+    }
+    let pkexec = crate::install::absolute_path_for("pkexec")
+        .ok_or_else(|| std::io::Error::other("pkexec not found in /usr/bin or /bin"))?;
+    std::process::Command::new(pkexec)
+        .arg(&canonical)
         .arg("install")
         .spawn()
+}
+
+/// `true` iff `path` is the canonical install location or anywhere under
+/// `/usr/`. These trees are root-owned on every supported distro, so the
+/// binary about to be elevated by `pkexec` can't have been swapped out by a
+/// non-root attacker.
+fn is_safe_install_source(path: &std::path::Path) -> bool {
+    if path == std::path::Path::new(crate::install::INSTALL_BIN) {
+        return true;
+    }
+    path.starts_with("/usr/")
 }
 
 #[derive(Debug, PartialEq, Eq)]
