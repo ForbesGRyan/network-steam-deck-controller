@@ -37,6 +37,7 @@
 //! not automate that — the goal is to validate the protocol crate against
 //! real bytes, not to manage device ownership.
 
+mod connection;
 mod sysfs;
 
 #[cfg(not(target_os = "linux"))]
