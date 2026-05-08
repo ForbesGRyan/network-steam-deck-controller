@@ -43,7 +43,7 @@ fn parse_control_dir() -> PathBuf {
 fn main() -> eframe::Result {
     let native_options = eframe::NativeOptions {
         viewport: eframe::egui::ViewportBuilder::default()
-            .with_fullscreen(true)
+            .with_maximized(true)
             .with_title("Network Deck"),
         ..Default::default()
     };

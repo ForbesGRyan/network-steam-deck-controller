@@ -23,7 +23,7 @@ full-duplex (rumble flows back to the Deck).
 Decision history (most recent first):
 
 - **2026-05-08** — Added a Deck-side kiosk UI (`crates/kiosk-deck`, `eframe`/
-  `egui` fullscreen app) so the user can pause/resume controller sharing
+  `egui` maximized window) so the user can pause/resume controller sharing
   from the touchscreen while a Windows game is using the controller. The
   daemon and kiosk talk through a shared dir `/run/network-deck/` (mode
   0777, single-user device): daemon writes `status.json` each tick,
@@ -59,7 +59,7 @@ Decision history (most recent first):
 |   - publishes Status + reads paused flag             |
 |         via /run/network-deck/                       |
 |                                                      |
-| kiosk-deck (Rust, eframe/egui) — fullscreen touch UI |
+| kiosk-deck (Rust, eframe/egui) — maximized touch UI  |
 |   - reads /run/network-deck/status.json (4 Hz)       |
 |   - creates/removes /run/network-deck/paused on tap  |
 |   - launched via Steam library "Add Non-Steam Game"  |
@@ -88,7 +88,7 @@ Decision history (most recent first):
 - `crates/server-deck/` — Linux binary. Drives `usbip bind` based on
   beacon state. Publishes daemon view via `/run/network-deck/status.json`
   and respects `/run/network-deck/paused`.
-- `crates/kiosk-deck/` — Linux GUI binary (`eframe`/`egui`). Fullscreen
+- `crates/kiosk-deck/` — Linux GUI binary (`eframe`/`egui`). Maximized
   touch-screen app for pausing/resuming controller sharing. Reads
   `status.json`; toggles the `paused` flag on tap. Launched via Steam
   library as a non-Steam game.

@@ -33,7 +33,7 @@ alternative and why this design was chosen.
 crates/
   discovery/      Ed25519 identity, signed-UDP beacon, trust file, pair flow
   server-deck/    Linux binary: sysfs busid lookup + usbip bind state machine
-  kiosk-deck/     Linux GUI: fullscreen touch UI for pause/resume on the Deck
+  kiosk-deck/     Linux GUI: maximized touch UI for pause/resume on the Deck
   client-win/     Windows binary: tray app + usbip.exe attach state machine
 scripts/
   install-deck.sh                Deck-side installer (pacman + systemd + kiosk)
