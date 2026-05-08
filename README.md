@@ -65,7 +65,21 @@ sudo ./scripts/install-deck.sh
 ```
 
 This installs `usbip` from pacman, enables `usbipd.service`, drops
-`server-deck` into `/usr/local/bin`, and installs the systemd unit.
+`server-deck` into `/usr/local/bin`, and installs the systemd unit. The
+installer also drops the `network-deck-kiosk` binary plus a `.desktop`
+entry, so a touch-screen pause/resume UI is available from Game Mode
+once you wire it into Steam.
+
+#### Add the kiosk to Game Mode
+
+One-time manual step (we don't write into Steam's `shortcuts.vdf`):
+
+1. Reboot to Desktop Mode (Power → Switch to Desktop).
+2. Open Steam (the desktop client).
+3. Games → Add a Non-Steam Game to My Library...
+4. Browse to `/usr/local/bin/network-deck-kiosk` → Add Selected Programs.
+5. Switch back to Game Mode; "Network Deck" appears in your library.
+6. Tap it from Game Mode whenever you want to pause/resume controller sharing.
 
 ### On Windows
 
