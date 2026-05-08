@@ -38,6 +38,8 @@ use deck_protocol::{AuthKey, Buttons, ControllerState};
 
 #[cfg(windows)]
 mod driver;
+#[cfg(windows)]
+mod usbip_cli;
 
 const DEFAULT_PORT: u16 = 49152;
 const PRINT_EVERY: Duration = Duration::from_millis(50);
