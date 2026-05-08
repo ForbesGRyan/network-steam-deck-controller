@@ -15,10 +15,20 @@ pub mod netifs;
 pub mod packet;
 pub mod pair;
 pub mod state_dir;
+pub(crate) mod time;
 pub mod trust;
 
 pub use beacon::Beacon;
 pub use identity::{load_or_generate as load_or_generate_identity, Identity};
 pub use packet::MAGIC as BEACON_MAGIC;
-pub use pair::{run_pair_with_candidates, PairCandidate};
+pub use pair::{run_pair_with, PairCandidate};
 pub use trust::{load as load_trust, save as save_trust, TrustedPeer};
+
+/// LAN data-plane UDP port. Both ends bind here; beacon broadcasts target it.
+pub const BEACON_PORT: u16 = 49152;
+
+/// Steam Deck controller USB IDs (Valve Software : "unknown product").
+/// Hex-string form to match `idVendor`/`idProduct` sysfs files and
+/// usbip-win2's `list -r` output.
+pub const DECK_VID: &str = "28de";
+pub const DECK_PID: &str = "1205";

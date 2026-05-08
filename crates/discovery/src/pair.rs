@@ -17,7 +17,7 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant};
 
 use crate::beacon::{is_within_replay_window, REPLAY_WINDOW_US};
 use crate::identity::Identity;
@@ -25,6 +25,7 @@ use crate::packet::{
     self, fingerprint, fingerprint_str, BeaconPacket, PUBKEY_LEN, FLAG_ACCEPT, FLAG_PAIRING,
     FPR_LEN, PACKET_LEN,
 };
+use crate::time::{now_iso8601, now_us};
 use crate::trust::{save as save_trust, TrustedPeer};
 
 /// Window over which we collect distinct PAIRING beacons before showing the
@@ -96,8 +97,14 @@ pub trait PairUI {
 
 const TICK: Duration = Duration::from_millis(200);
 
-/// Headless pair state machine. Drives discovery, asks the UI for a
-/// decision via `PairUI::prompt_peer`, exchanges ACCEPT, persists trust.
+/// Headless pair state machine. Drives discovery, asks the UI to pick a
+/// candidate via `PairUI::prompt_candidates` (default impl falls through to
+/// `prompt_peer` per-candidate in arrival order), exchanges ACCEPT,
+/// persists trust.
+///
+/// Buffers every distinct PAIRING peer seen during a short window so an
+/// attacker who races the legitimate peer's first beacon can't pre-empt the
+/// prompt.
 ///
 /// Sends are issued on a separate thread so a long block in `prompt_peer`
 /// (e.g. the user pondering an Accept/Reject button) doesn't stall our
@@ -106,17 +113,6 @@ const TICK: Duration = Duration::from_millis(200);
 /// only one side ever reached its prompt — the deadlock the user reported
 /// on 2026-05-08.
 pub fn run_pair_with<U: PairUI>(cfg: &PairConfig, ui: &mut U) -> PairOutcome {
-    run_pair_with_candidates(cfg, ui)
-}
-
-/// Pair flow that buffers every distinct PAIRING peer seen during a short
-/// window and lets the UI's `prompt_candidates` pick one — defending
-/// against an attacker who races the legitimate peer's first beacon.
-///
-/// Equivalent to `run_pair_with` for UIs that don't override
-/// `prompt_candidates`, since the default impl walks the batch with
-/// `prompt_peer` in arrival order.
-pub fn run_pair_with_candidates<U: PairUI>(cfg: &PairConfig, ui: &mut U) -> PairOutcome {
     cfg.recv_sock.set_read_timeout(Some(TICK)).ok();
     ui.on_started(
         &fingerprint_str(&fingerprint(&cfg.identity.pubkey)),
@@ -407,33 +403,3 @@ pub fn run_pair<R: Read, W: Write>(
     run_pair_with(cfg, &mut ui)
 }
 
-#[allow(clippy::cast_possible_truncation)]
-fn now_us() -> u64 {
-    SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_micros() as u64).unwrap_or(0)
-}
-
-fn now_iso8601() -> String {
-    let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default();
-    let secs = now.as_secs();
-    #[allow(clippy::cast_possible_wrap)]
-    let (y, mo, d, h, mi, s) = civil_from_secs(secs as i64);
-    format!("{y:04}-{mo:02}-{d:02}T{h:02}:{mi:02}:{s:02}Z")
-}
-
-#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-fn civil_from_secs(secs: i64) -> (i32, u32, u32, u32, u32, u32) {
-    let day_secs = 86_400_i64;
-    let days = secs.div_euclid(day_secs);
-    let tod = secs.rem_euclid(day_secs);
-    let z = days + 719_468;
-    let era = z.div_euclid(146_097);
-    let doe = z.rem_euclid(146_097);
-    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
-    let y = (yoe + era * 400) as i32;
-    let doy = (doe - (365 * yoe + yoe / 4 - yoe / 100)) as u32;
-    let mp = (5 * doy + 2) / 153;
-    let d = doy - (153 * mp + 2) / 5 + 1;
-    let m = if mp < 10 { mp + 3 } else { mp - 9 };
-    let y = if m <= 2 { y + 1 } else { y };
-    (y, m, d, (tod / 3600) as u32, ((tod / 60) % 60) as u32, (tod % 60) as u32)
-}

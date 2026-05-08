@@ -48,13 +48,13 @@ impl PairWorker {
     ) -> std::io::Result<Self> {
         use std::net::{Ipv4Addr, UdpSocket};
 
-        let sock = UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 49152))?;
+        let sock = UdpSocket::bind((Ipv4Addr::UNSPECIFIED, discovery::BEACON_PORT))?;
         sock.set_broadcast(true).ok();
 
         let cfg = PairConfig {
             identity,
             recv_sock: sock,
-            targets: discovery::netifs::broadcast_targets(49152),
+            targets: discovery::netifs::broadcast_targets(discovery::BEACON_PORT),
             self_name,
             state_dir,
             timeout: Duration::from_secs(120),

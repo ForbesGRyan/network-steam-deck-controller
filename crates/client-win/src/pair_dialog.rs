@@ -20,6 +20,8 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
     MessageBoxW, IDYES, MB_ICONERROR, MB_ICONINFORMATION, MB_ICONQUESTION, MB_OK, MB_YESNO,
 };
 
+use crate::util::wide;
+
 /// Run pair against `sock`, surfacing the accept prompt + result via
 /// `MessageBoxW`. Consumes the socket — on success and failure both, the
 /// socket is dropped here. The caller decides what to do next based on the
@@ -78,8 +80,4 @@ fn message_box(body: &str, title: &str, flags: u32) -> i32 {
     // SAFETY: pointers are NUL-terminated, valid UTF-16. `hwnd = null` =
     // top-level dialog with no parent. flags are valid `MB_*` constants.
     unsafe { MessageBoxW(std::ptr::null_mut(), body_w.as_ptr(), title_w.as_ptr(), flags) }
-}
-
-fn wide(s: &str) -> Vec<u16> {
-    s.encode_utf16().chain(std::iter::once(0)).collect()
 }

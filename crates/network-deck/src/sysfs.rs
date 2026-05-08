@@ -4,9 +4,6 @@ use std::fs;
 use std::io;
 use std::path::Path;
 
-pub const DECK_VID: &str = "28de";
-pub const DECK_PID: &str = "1205";
-
 #[derive(Debug)]
 pub enum SysfsError {
     Io(#[allow(dead_code)] io::Error),
@@ -53,9 +50,9 @@ mod tests {
     fn finds_deck_among_multiple_devices() {
         let root = tempdir().unwrap();
         make_device(root.path(), "1-1", "1234", "5678");
-        make_device(root.path(), "3-3", DECK_VID, DECK_PID);
+        make_device(root.path(), "3-3", discovery::DECK_VID, discovery::DECK_PID);
         make_device(root.path(), "usb1", "1d6b", "0002");
-        let busid = find_deck_busid(root.path(), DECK_VID, DECK_PID).unwrap();
+        let busid = find_deck_busid(root.path(), discovery::DECK_VID, discovery::DECK_PID).unwrap();
         assert_eq!(busid, "3-3");
     }
 
@@ -63,14 +60,14 @@ mod tests {
     fn returns_not_found_when_absent() {
         let root = tempdir().unwrap();
         make_device(root.path(), "1-1", "1234", "5678");
-        let err = find_deck_busid(root.path(), DECK_VID, DECK_PID);
+        let err = find_deck_busid(root.path(), discovery::DECK_VID, discovery::DECK_PID);
         assert!(matches!(err, Err(SysfsError::NotFound)));
     }
 
     #[test]
     fn handles_missing_devices_dir() {
         let root = tempdir().unwrap();
-        let err = find_deck_busid(root.path(), DECK_VID, DECK_PID);
+        let err = find_deck_busid(root.path(), discovery::DECK_VID, discovery::DECK_PID);
         assert!(matches!(err, Err(SysfsError::Io(_))));
     }
 
@@ -80,8 +77,8 @@ mod tests {
         let dir = root.path().join("bus/usb/devices/usb1");
         fs::create_dir_all(&dir).unwrap();
         fs::write(dir.join("idVendor"), "1d6b\n").unwrap();
-        make_device(root.path(), "3-3", DECK_VID, DECK_PID);
-        let busid = find_deck_busid(root.path(), DECK_VID, DECK_PID).unwrap();
+        make_device(root.path(), "3-3", discovery::DECK_VID, discovery::DECK_PID);
+        let busid = find_deck_busid(root.path(), discovery::DECK_VID, discovery::DECK_PID).unwrap();
         assert_eq!(busid, "3-3");
     }
 }

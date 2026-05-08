@@ -5,13 +5,14 @@
 use std::io;
 use std::net::{Ipv4Addr, SocketAddr, UdpSocket};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant};
 
 use crate::crypto::{derive_session_key, SESSION_KEY_LEN};
 use crate::identity::Identity;
 use crate::packet::{
     self, fingerprint, BeaconPacket, FPR_LEN, PACKET_LEN,
 };
+use crate::time::now_us;
 use crate::trust::TrustedPeer;
 
 /// ±wall-clock skew tolerated for beacon packets, in microseconds.
@@ -37,15 +38,12 @@ pub struct LivePeer {
     pub last_seen: Instant,
 }
 
-#[derive(Default)]
-struct PeerState { live: Option<LivePeer> }
-
 /// Runtime state shared between the broadcast tick, the recv-callback, and
 /// the data plane's `current_peer()` reader.
 pub struct Beacon {
     identity: Arc<Identity>,
     peer: Arc<TrustedPeer>,
-    state: Arc<Mutex<PeerState>>,
+    live: Arc<Mutex<Option<LivePeer>>>,
     send_sock: UdpSocket,
     broadcast_dests: Vec<SocketAddr>,
     session_key: [u8; SESSION_KEY_LEN],
@@ -75,7 +73,7 @@ impl Beacon {
         let session_key = derive_session_key(&identity.pubkey, &peer.pubkey);
         Ok(Self {
             identity, peer,
-            state: Arc::new(Mutex::new(PeerState::default())),
+            live: Arc::new(Mutex::new(None)),
             send_sock,
             broadcast_dests,
             session_key,
@@ -127,26 +125,27 @@ impl Beacon {
         #[allow(clippy::cast_possible_truncation)]
         let pkt32 = decoded.timestamp_us as u32;
         if !is_within_replay_window(pkt32, now32, REPLAY_WINDOW_US) { return; }
-        // Normalize src to the data-plane listen port (fix #1: port mismatch).
-        // The sender's beacon comes from an ephemeral send socket; the actual
-        // data-plane port we must reach is self.listen_port.
+        // Normalize src to the data-plane listen port. The sender's beacon
+        // comes from an ephemeral send socket; the data-plane port we must
+        // reach is self.listen_port.
         let normalized = SocketAddr::new(src.ip(), self.listen_port);
-        if let Ok(mut s) = self.state.lock() {
-            s.live = Some(LivePeer { addr: normalized, last_seen: Instant::now() });
+        if let Ok(mut slot) = self.live.lock() {
+            *slot = Some(LivePeer { addr: normalized, last_seen: Instant::now() });
         }
     }
 
     /// Current live peer address if a beacon was seen recently.
     #[must_use]
     pub fn current_peer(&self) -> Option<SocketAddr> {
-        self.state.lock().ok().and_then(|s| s.live.map(|l| l.addr))
+        self.live.lock().ok().and_then(|s| s.map(|l| l.addr))
     }
 
     #[must_use]
     pub fn current_peer_with_age(&self) -> Option<(SocketAddr, Duration)> {
-        self.state.lock().ok().and_then(|s| {
-            s.live.map(|l| (l.addr, l.last_seen.elapsed()))
-        })
+        self.live
+            .lock()
+            .ok()
+            .and_then(|s| s.map(|l| (l.addr, l.last_seen.elapsed())))
     }
 
     fn peer_fpr(&self) -> [u8; FPR_LEN] { fingerprint(&self.peer.pubkey) }
@@ -161,14 +160,6 @@ pub fn spawn_broadcast(beacon: Arc<Beacon>) {
             std::thread::sleep(BEACON_INTERVAL);
         })
         .ok();
-}
-
-#[allow(clippy::cast_possible_truncation)]
-fn now_us() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_micros() as u64)
-        .unwrap_or(0)
 }
 
 #[cfg(test)]

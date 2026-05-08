@@ -2,21 +2,16 @@
 //!
 //! User-scope registry write — no admin needed.
 
-use std::ffi::OsStr;
-use std::os::windows::ffi::OsStrExt;
-
-use windows_sys::Win32::Foundation::ERROR_SUCCESS;
+use windows_sys::Win32::Foundation::{ERROR_FILE_NOT_FOUND, ERROR_SUCCESS};
 use windows_sys::Win32::System::Registry::{
     RegCloseKey, RegDeleteValueW, RegOpenKeyExW, RegQueryValueExW, RegSetValueExW, HKEY,
     HKEY_CURRENT_USER, KEY_READ, KEY_WRITE, REG_SZ,
 };
 
+use crate::util::wide;
+
 const VALUE_NAME: &str = "NetworkDeck";
 const SUBKEY: &str = r"Software\Microsoft\Windows\CurrentVersion\Run";
-
-fn wide(s: &str) -> Vec<u16> {
-    OsStr::new(s).encode_wide().chain(std::iter::once(0)).collect()
-}
 
 /// Set the autostart entry to the path of the currently-running exe. Idempotent.
 ///
@@ -39,8 +34,7 @@ pub fn disable() -> Result<(), u32> {
     let mut key: HKEY = std::ptr::null_mut();
     unsafe {
         let r = RegOpenKeyExW(HKEY_CURRENT_USER, subkey.as_ptr(), 0, KEY_WRITE, &raw mut key);
-        if r == 2 {
-            // Run key absent — nothing to disable.
+        if r == ERROR_FILE_NOT_FOUND {
             return Ok(());
         }
         if r != ERROR_SUCCESS {
@@ -48,8 +42,7 @@ pub fn disable() -> Result<(), u32> {
         }
         let r = RegDeleteValueW(key, value.as_ptr());
         let _ = RegCloseKey(key);
-        // ERROR_FILE_NOT_FOUND = 2; treat as already-disabled.
-        if r != ERROR_SUCCESS && r != 2 {
+        if r != ERROR_SUCCESS && r != ERROR_FILE_NOT_FOUND {
             return Err(r);
         }
     }

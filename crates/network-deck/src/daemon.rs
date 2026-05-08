@@ -10,12 +10,13 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
+use discovery::{BEACON_PORT, DECK_PID, DECK_VID};
+
 use crate::connection::{Action, Connection, RealRunner, State};
 use crate::control;
 use crate::firewall::PeerLock;
-use crate::sysfs::{find_deck_busid, DECK_PID, DECK_VID};
+use crate::sysfs::find_deck_busid;
 
-const BEACON_PORT: u16 = 49152;
 const TICK_INTERVAL: Duration = Duration::from_millis(500);
 
 pub struct Args {
@@ -117,6 +118,7 @@ pub fn run(args: Args) {
         let _ = signal_hook::flag::register(sig, term.clone());
     }
 
+    let mut last_status: Option<control::Status> = None;
     while !term.load(Ordering::Relaxed) {
         let beacon_present = beacon
             .current_peer_with_age()
@@ -133,8 +135,13 @@ pub fn run(args: Args) {
             bound: matches!(conn.state(), State::Bound),
             paused,
         };
-        if let Err(e) = control::write_status(&args.control_dir, &status) {
-            eprintln!("control: write_status failed: {e}");
+        // Skip the atomic-rename dance when nothing changed — saves eMMC
+        // wear and the kiosk reader's no-op JSON parse on every tick.
+        if last_status.as_ref() != Some(&status) {
+            if let Err(e) = control::write_status(&args.control_dir, &status) {
+                eprintln!("control: write_status failed: {e}");
+            }
+            last_status = Some(status);
         }
         std::thread::sleep(TICK_INTERVAL);
     }

@@ -11,6 +11,12 @@ use std::sync::Arc;
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
+/// How long to reuse a `usbip port` result before re-shelling. The attach
+/// loop ticks at 500 ms; without this, we'd `CreateProcess` on every tick
+/// just to detect remote drop.
+#[cfg(windows)]
+const PORT_CACHE_TTL: Duration = Duration::from_secs(2);
+
 /// Stoppable beacon recv thread. Holds the bound `UdpSocket` for its
 /// lifetime; on `stop()` returns the socket back to the caller so the pair
 /// flow can take it over without re-binding 49152 (which fails — we already
@@ -67,8 +73,11 @@ mod pair_dialog;
 mod tray;
 #[cfg(windows)]
 mod usbip_cli;
+#[cfg(windows)]
+mod util;
 
-const DEFAULT_PORT: u16 = 49152;
+use discovery::BEACON_PORT as DEFAULT_PORT;
+
 const TICK_INTERVAL: Duration = Duration::from_millis(500);
 
 enum Mode {
@@ -205,6 +214,7 @@ fn run_normal(identity: &Arc<discovery::Identity>, state_dir: &std::path::Path) 
 #[cfg(windows)]
 struct CliDriver {
     cli: crate::usbip_cli::UsbipCli,
+    port_cache: Option<(Instant, Vec<String>)>,
 }
 
 #[cfg(windows)]
@@ -214,14 +224,25 @@ impl crate::attach::UsbipDriver for CliDriver {
             .list_remote(host)
             .ok()?
             .into_iter()
-            .find(|d| d.vid == "28de" && d.pid == "1205")
+            .find(|d| d.vid == discovery::DECK_VID && d.pid == discovery::DECK_PID)
             .map(|d| d.busid)
     }
     fn attach(&mut self, host: &str, busid: &str) -> bool {
+        // Attaching changes the port table; invalidate so the next
+        // `ported_busids` call re-shells and the state machine sees the
+        // new busid in <PORT_CACHE_TTL.
+        self.port_cache = None;
         self.cli.attach(host, busid).is_ok()
     }
     fn ported_busids(&mut self) -> Vec<String> {
-        self.cli.port().unwrap_or_default()
+        if let Some((at, ref ports)) = self.port_cache {
+            if at.elapsed() < PORT_CACHE_TTL {
+                return ports.clone();
+            }
+        }
+        let ports = self.cli.port().unwrap_or_default();
+        self.port_cache = Some((Instant::now(), ports.clone()));
+        ports
     }
 }
 
@@ -249,14 +270,14 @@ fn run_attach_loop(
         }
     };
 
-    let mut driver = CliDriver { cli };
+    let mut driver = CliDriver { cli, port_cache: None };
 
     let (tray_rx, tray_handle) = tray::spawn();
     let mut sm = Attach::default();
     let mut paused = false;
+    let mut last_tooltip = String::new();
 
     loop {
-        // Drain tray events.
         while let Ok(event) = tray_rx.try_recv() {
             match event {
                 TrayEvent::Connect => {
@@ -285,15 +306,13 @@ fn run_attach_loop(
                             // Re-exec to pick up the new trust file cleanly.
                             // Drop the tray + driver state by exiting.
                             eprintln!("pair complete — restarting");
-                            if let Ok(exe) = std::env::current_exe() {
-                                let _ = std::process::Command::new(exe).spawn();
-                            }
-                            // process::exit skips destructors. The pair flow
-                            // already consumed the recv socket, but the tray
-                            // handle is still live — drop it so the new exe
-                            // doesn't race us on tray-icon HWND cleanup.
+                            // Drop the tray handle BEFORE the re-exec so
+                            // NIM_DELETE on our icon completes before the
+                            // new process paints its own (avoids a brief
+                            // double-icon flash) and so process::exit
+                            // doesn't skip the tray destructor.
                             drop(tray_handle);
-                            std::process::exit(0);
+                            util::reexec_self();
                         }
                         other => {
                             eprintln!("pair did not complete: {other:?}");
@@ -344,7 +363,10 @@ fn run_attach_loop(
             (State::Idle, _) if paused => "Network Deck — paused".to_owned(),
             (State::Idle, _) => "Network Deck — searching".to_owned(),
         };
-        tray_handle.set_tooltip(&tooltip);
+        if tooltip != last_tooltip {
+            tray_handle.set_tooltip(&tooltip);
+            last_tooltip.clone_from(&tooltip);
+        }
 
         std::thread::sleep(TICK_INTERVAL);
     }
@@ -362,12 +384,12 @@ fn first_run_pair(identity: Arc<discovery::Identity>, state_dir: &std::path::Pat
     // Heads-up dialog so the user can put the Deck in pair mode before we
     // start broadcasting. The pair flow has its own 120 s timeout once we
     // proceed; this dialog is the chance to hit Cancel via window close.
-    let title = "Network Deck — first-time pair"
-        .encode_utf16().chain(std::iter::once(0)).collect::<Vec<_>>();
-    let body = "No paired Deck found.\n\n\
-                On the Deck, launch Network Deck and tap \"Start pairing\".\n\
-                Click OK to start pairing on this PC."
-        .encode_utf16().chain(std::iter::once(0)).collect::<Vec<_>>();
+    let title = util::wide("Network Deck — first-time pair");
+    let body = util::wide(
+        "No paired Deck found.\n\n\
+         On the Deck, launch Network Deck and tap \"Start pairing\".\n\
+         Click OK to start pairing on this PC.",
+    );
     // SAFETY: NUL-terminated UTF-16 strings, null hwnd, valid flags.
     unsafe {
         MessageBoxW(
@@ -386,13 +408,7 @@ fn first_run_pair(identity: Arc<discovery::Identity>, state_dir: &std::path::Pat
 
     let outcome = pair_dialog::run(sock, identity, hostname(), state_dir);
     match outcome {
-        discovery::pair::PairOutcome::Paired(_) => {
-            // Re-exec so run_normal hits the trust-loaded branch.
-            if let Ok(exe) = std::env::current_exe() {
-                let _ = std::process::Command::new(exe).spawn();
-            }
-            std::process::exit(0);
-        }
+        discovery::pair::PairOutcome::Paired(_) => util::reexec_self(),
         other => {
             eprintln!("pair did not complete: {other:?}");
             std::process::exit(1);
