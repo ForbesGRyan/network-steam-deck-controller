@@ -37,6 +37,8 @@ use deck_protocol::wire::{self, Channel, Header, INPUT_PACKET_LEN, OUTPUT_PACKET
 use deck_protocol::{AuthKey, Buttons, ControllerState};
 
 #[cfg(windows)]
+mod attach;
+#[cfg(windows)]
 mod driver;
 #[cfg(windows)]
 mod usbip_cli;
