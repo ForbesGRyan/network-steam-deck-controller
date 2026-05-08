@@ -10,6 +10,7 @@
 //! ```
 
 mod connection;
+mod control;
 mod sysfs;
 
 #[cfg(not(target_os = "linux"))]
