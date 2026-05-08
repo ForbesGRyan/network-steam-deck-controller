@@ -40,6 +40,10 @@ pub fn disable() -> Result<(), u32> {
     let mut key: HKEY = std::ptr::null_mut();
     unsafe {
         let r = RegOpenKeyExW(HKEY_CURRENT_USER, subkey.as_ptr(), 0, KEY_WRITE, &mut key);
+        if r == 2 {
+            // Run key absent — nothing to disable.
+            return Ok(());
+        }
         if r != ERROR_SUCCESS {
             return Err(r);
         }
