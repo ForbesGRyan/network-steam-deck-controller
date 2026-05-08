@@ -67,13 +67,13 @@ pub fn load_or_generate(state_dir: &Path) -> Result<Identity, IdentityError> {
 
 #[cfg(unix)]
 fn write_secret_file(path: &Path, bytes: &[u8]) -> io::Result<()> {
+    use std::io::Write;
     use std::os::unix::fs::OpenOptionsExt;
     let mut f = fs::OpenOptions::new()
         .write(true)
         .create_new(true)
         .mode(0o600)
         .open(path)?;
-    use std::io::Write;
     f.write_all(bytes)?;
     Ok(())
 }

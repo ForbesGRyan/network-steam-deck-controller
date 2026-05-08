@@ -1,0 +1,72 @@
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build-linux:
+    name: build network-deck (linux)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Install eframe system deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libxkbcommon-dev libwayland-dev \
+            libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev libxcb1-dev \
+            libfontconfig1-dev
+      - run: cargo build --release -p network-deck --locked
+      - name: Stage artifact
+        run: |
+          mkdir -p stage
+          cp target/release/network-deck stage/network-deck-${{ github.ref_name }}-x86_64-linux
+      - uses: actions/upload-artifact@v4
+        with:
+          name: network-deck-linux
+          path: stage/network-deck-*
+          if-no-files-found: error
+
+  build-windows:
+    name: build client-win (windows)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build --release -p client-win --locked
+      - name: Stage artifact
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path stage | Out-Null
+          Copy-Item target/release/client-win.exe "stage/client-win-${{ github.ref_name }}-x86_64-windows.exe"
+          Copy-Item scripts/install-windows.ps1 stage/
+      - uses: actions/upload-artifact@v4
+        with:
+          name: client-win-windows
+          path: stage/*
+          if-no-files-found: error
+
+  release:
+    name: publish GitHub Release
+    runs-on: ubuntu-latest
+    needs: [build-linux, build-windows]
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Create release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*
+          generate_release_notes: true
+          fail_on_unmatched_files: true
