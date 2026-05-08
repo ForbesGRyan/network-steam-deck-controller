@@ -1,8 +1,0 @@
-[Desktop Entry]
-Type=Application
-Name=Network Deck
-Comment=Pause/resume Steam Deck controller sharing
-Exec=/usr/local/bin/network-deck-kiosk
-Icon=input-gaming
-Terminal=false
-Categories=Utility;

@@ -5,11 +5,11 @@ USB/IP — `usbip-host` on the Deck, `usbip-win2` on Windows. This repo
 provides the discovery + lifecycle glue that makes the two ends find each
 other and stay attached.
 
-> **Status:** complete pivot. `discovery` crate, `server-deck`, and
-> `client-win` are all rewritten around the usbip backend. Hardware-tested:
-> `usbipd` + `usbip-win2 v0.9.7.7` produces a Deck that Steam recognizes
-> and works in-game with no custom driver required. See
-> [ARCHITECTURE.md](ARCHITECTURE.md) for design detail.
+> **Status:** complete pivot. `discovery` crate, `network-deck`
+> (single Deck binary), and `client-win` are all rewritten around the
+> usbip backend. Hardware-tested: `usbipd` + `usbip-win2 v0.9.7.7`
+> produces a Deck that Steam recognizes and works in-game with no custom
+> driver required. See [ARCHITECTURE.md](ARCHITECTURE.md) for design detail.
 
 ## Why
 
@@ -32,20 +32,14 @@ alternative and why this design was chosen.
 ```
 crates/
   discovery/      Ed25519 identity, signed-UDP beacon, trust file, pair flow
-  server-deck/    Linux binary: sysfs busid lookup + usbip bind state machine
-  kiosk-deck/     Linux GUI: maximized touch UI for pause/resume on the Deck
+  network-deck/   Single Deck-side binary: GUI + daemon + pair + installer
   client-win/     Windows binary: tray app + usbip.exe attach state machine
 scripts/
-  install-deck.sh                Deck-side installer (pacman + systemd + kiosk)
   install-windows.ps1            Windows-side installer (usbip-win2 + binary drop)
-  network-deck.tmpfiles          Creates /run/network-deck/ at boot (kiosk IPC)
-  network-deck-kiosk.desktop     XDG entry for the kiosk app
 ARCHITECTURE.md   design history, component diagram, wire+IPC contracts, open risks
 ```
 
 ## Build
-
-The Rust workspace builds anywhere `cargo` runs:
 
 ```sh
 cargo build --workspace
@@ -56,61 +50,52 @@ Per-binary platform support:
 
 | Binary | Real platform | Other platforms |
 |---|---|---|
-| `server-deck` | Linux (shells out to `usbip`) | builds, exits with "Linux only" |
-| `kiosk-deck` (`network-deck-kiosk`) | Linux (eframe/egui, X11 or Wayland) | builds, exits with "Linux only" |
+| `network-deck` | Linux (eframe + usbip + signal handling) | builds, exits with "Linux only" |
 | `client-win` | Windows (shells out to `usbip.exe`, Win32 tray) | builds, no-ops tray calls |
 
 ### cargo-make shortcuts
 
-A `Makefile.toml` is included for the common build/install/pair workflows.
-One-time setup:
-
 ```sh
-cargo install cargo-make
+cargo install cargo-make    # one-time
+cargo make build-deck       # release build of network-deck (Linux)
+cargo make build-win        # release build of client-win (Windows)
+cargo make install-deck     # build + run `sudo network-deck install`
+cargo make install-win      # build + run scripts/install-windows.ps1 (admin)
+cargo make pair-deck        # one-shot pair on the Deck
+cargo make pair-win         # one-shot pair on Windows
+cargo make verify           # test + clippy + fmt --check
 ```
-
-Then on each platform:
-
-| Task | What it does |
-|---|---|
-| `cargo make build-all` | Release build of every member (cross-platform safe). |
-| `cargo make build-deck` | Release build of `server-deck` + `kiosk-deck` (Linux only). |
-| `cargo make build-win` | Release build of `client-win` (Windows only). |
-| `cargo make install-deck` | Build Deck bins + `sudo bash scripts/install-deck.sh`. |
-| `cargo make install-win` | Build `client-win` + run `scripts/install-windows.ps1` (admin). |
-| `cargo make pair-deck` / `pair-win` | One-shot pair flow on the corresponding side. |
-| `cargo make verify` | `test` + `clippy` + `fmt --check`. |
-| `cargo make deck-service-restart` | `sudo systemctl restart network-deck-server.service`. |
-| `cargo make deck-status` | Tail the daemon's journalctl log. |
-
-Each task refuses to run on the wrong OS, so `cargo make build-deck` on
-Windows fails fast with a "platform not supported" message instead of
-attempting a meaningless build.
 
 ## Install
 
 ### On the Deck (SteamOS)
 
+Build and run the binary's own installer:
+
+```sh
+cargo build --release -p network-deck
+sudo ./target/release/network-deck install
 ```
-sudo ./scripts/install-deck.sh
-```
 
-This installs `usbip` from pacman, enables `usbipd.service`, drops
-`server-deck` into `/usr/local/bin`, and installs the systemd unit. The
-installer also drops the `network-deck-kiosk` binary plus a `.desktop`
-entry, so a touch-screen pause/resume UI is available from Game Mode
-once you wire it into Steam.
+What `install` does (idempotent):
 
-#### Add the kiosk to Game Mode
+- `pacman -S usbip` if missing (one-time, briefly toggles `steamos-readonly`).
+- Loads + persists `usbip-host` / `vhci-hcd` kernel modules.
+- Enables `usbipd.service`.
+- Copies itself into `~/network-deck/network-deck` (root-owned).
+- Writes `/etc/sudoers.d/network-deck` (NOPASSWD for the kiosk → daemon hop).
+- Drops a `.desktop` entry in `~/.local/share/applications/`.
+- Disables the legacy `network-deck-server.service` if it exists.
 
-One-time manual step (we don't write into Steam's `shortcuts.vdf`):
+#### Add to Game Mode (one-time)
 
 1. Reboot to Desktop Mode (Power → Switch to Desktop).
 2. Open Steam (the desktop client).
 3. Games → Add a Non-Steam Game to My Library...
-4. Browse to `/usr/local/bin/network-deck-kiosk` → Add Selected Programs.
+4. Browse to `~/network-deck/network-deck` → Add Selected Programs.
 5. Switch back to Game Mode; "Network Deck" appears in your library.
-6. Tap it from Game Mode whenever you want to pause/resume controller sharing.
+6. Tap it whenever you want to share the controller. Closing the window
+   stops the daemon and unbinds the controller — no background service.
 
 ### On Windows
 
@@ -129,18 +114,20 @@ self-registers for autostart on first run.
 One-shot. Run on each side at the same time:
 
 ```
-sudo /usr/local/bin/server-deck pair --state-dir /var/lib/network-deck   # Deck
+sudo ~/network-deck/network-deck pair                                    # Deck
 & "$env:LOCALAPPDATA\NetworkDeck\client-win.exe" pair                    # Windows
 ```
 
-Confirm matching fingerprints on both prompts within 120 s. After pair,
-enable the Deck service:
+Confirm matching fingerprints on both prompts within 120 s.
 
-```
-sudo systemctl enable --now network-deck-server.service
-```
+## Use
 
-The Windows tray will pick up the Deck's beacon and auto-attach.
+- Tap **Network Deck** in your Steam library (Game Mode).
+- The kiosk window opens and silently spawns the daemon as a child via
+  `sudo -n` (allowed by the sudoers entry).
+- The Windows tray picks up the Deck's beacon and auto-attaches.
+- Pause/resume from the kiosk's button — stays paired, just stops binding.
+- Close the kiosk → daemon gets SIGTERM → unbinds → exits cleanly.
 
 ## Troubleshooting
 
@@ -151,17 +138,22 @@ without isolation.
 **Controller drops mid-game:** a Wi-Fi blip causes a visible USB unplug
 under TCP transport. Some games recover; some require a restart. Keep
 the bridge on 5 GHz. The attach state machine retries automatically so
-the next game session will pick up without manual intervention.
+the next game session picks up without manual intervention.
 
 **vhci not available after suspend:** run `.\scripts\install-windows.ps1`
 again (idempotent) or restart the usbip-win2 service; the tray's attach
 state machine will reconnect once the driver is ready.
 
-**Kiosk shows "Daemon not running":** the kiosk reads
-`/run/network-deck/status.json`, which is populated by `server-deck`.
-Check `systemctl status network-deck-server.service` and that
-`/run/network-deck/` exists (created at boot via the tmpfiles entry; if
-not, run `sudo systemd-tmpfiles --create /etc/tmpfiles.d/network-deck.conf`).
+**Kiosk shows "First-time setup":** tap the **Install** button — it
+runs `sudo network-deck install` via `pkexec` and prompts for your
+password. Close and relaunch when it reports "Setup complete." If
+`pkexec` is unavailable (some headless or Game Mode sessions), fall
+back to running `sudo network-deck install` from Konsole.
+
+**`sudo -n` fails / "Daemon not running" persists:** the sudoers entry
+didn't write. Run `sudo -l` as the deck user — you should see a
+`NOPASSWD` entry for `~/network-deck/network-deck daemon`. If not,
+re-run `sudo network-deck install`.
 
 ## License
 

@@ -1,0 +1,180 @@
+//! The headless daemon: discovery beacon + bind/unbind state machine.
+//!
+//! Invoked by the GUI as `sudo -n network-deck daemon ...`, or directly for
+//! debugging. Catches SIGINT/SIGTERM/SIGHUP to unbind the controller and
+//! clear the status file before exiting.
+
+use std::net::{Ipv4Addr, UdpSocket};
+use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+use std::time::Duration;
+
+use crate::connection::{Connection, RealRunner, State};
+use crate::control;
+use crate::sysfs::{find_deck_busid, DECK_PID, DECK_VID};
+
+const BEACON_PORT: u16 = 49152;
+const TICK_INTERVAL: Duration = Duration::from_millis(500);
+
+pub struct Args {
+    pub state_dir: PathBuf,
+    pub sysfs_root: PathBuf,
+    pub control_dir: PathBuf,
+}
+
+pub fn run(args: Args) {
+    let identity = Arc::new(
+        discovery::identity::load_or_generate(&args.state_dir).unwrap_or_else(|e| {
+            eprintln!("identity load: {e:?}");
+            std::process::exit(1);
+        }),
+    );
+
+    let trusted = match discovery::trust::load(&args.state_dir) {
+        Ok(Some(p)) => Arc::new(p),
+        Ok(None) => {
+            eprintln!("no trusted peer; run `network-deck pair` first");
+            std::process::exit(1);
+        }
+        Err(e) => {
+            eprintln!("trust load: {e:?}");
+            std::process::exit(1);
+        }
+    };
+
+    let busid = find_deck_busid(&args.sysfs_root, DECK_VID, DECK_PID).unwrap_or_else(|e| {
+        eprintln!(
+            "could not find Steam Deck controller (VID {DECK_VID} PID {DECK_PID}) in sysfs: {e:?}"
+        );
+        std::process::exit(1);
+    });
+    eprintln!("found Deck controller at busid {busid}");
+
+    let bound = UdpSocket::bind((Ipv4Addr::UNSPECIFIED, BEACON_PORT)).unwrap_or_else(|e| {
+        eprintln!("bind 0.0.0.0:{BEACON_PORT}: {e}");
+        std::process::exit(1);
+    });
+
+    let beacon = Arc::new(
+        discovery::Beacon::new(
+            identity.clone(),
+            trusted.clone(),
+            discovery::netifs::broadcast_targets(BEACON_PORT),
+            super::hostname(),
+            BEACON_PORT,
+        )
+        .unwrap_or_else(|e| {
+            eprintln!("beacon init: {e:?}");
+            std::process::exit(1);
+        }),
+    );
+    discovery::beacon::spawn_broadcast(beacon.clone());
+
+    // Beacon recv thread: drains incoming beacons so live-peer state updates.
+    let beacon_recv = beacon.clone();
+    std::thread::Builder::new()
+        .name("discovery-recv".into())
+        .spawn(move || {
+            let mut buf = [0_u8; discovery::packet::PACKET_LEN];
+            loop {
+                if let Ok((n, src)) = bound.recv_from(&mut buf) {
+                    if n >= 4 && buf[0..4] == discovery::BEACON_MAGIC {
+                        beacon_recv.handle_packet(src, &buf[..n]);
+                    }
+                }
+            }
+        })
+        .ok();
+
+    eprintln!(
+        "supervising bind state for busid {busid} -> peer {} (fingerprint {})",
+        trusted.name,
+        identity.fingerprint_str(),
+    );
+
+    if let Err(e) = std::fs::create_dir_all(&args.control_dir) {
+        eprintln!("create_dir_all {}: {e}", args.control_dir.display());
+    }
+
+    // Spawn the hotkey listener — toggles `paused` on Steam+QAM or Vol±.
+    super::hotkey::spawn(args.control_dir.clone());
+
+    let mut conn = Connection::new(busid.clone());
+    let mut runner = RealRunner;
+
+    let term = Arc::new(AtomicBool::new(false));
+    for sig in [
+        signal_hook::consts::SIGTERM,
+        signal_hook::consts::SIGINT,
+        signal_hook::consts::SIGHUP,
+    ] {
+        let _ = signal_hook::flag::register(sig, term.clone());
+    }
+
+    while !term.load(Ordering::Relaxed) {
+        let beacon_present = beacon
+            .current_peer_with_age()
+            .is_some_and(|(_, age)| age <= discovery::beacon::STALE_AFTER);
+        let paused = control::is_paused(&args.control_dir);
+        let effective_peer_present = beacon_present && !paused;
+        if let Some(action) = conn.tick(effective_peer_present, &mut runner) {
+            eprintln!("connection: {action:?} (state={:?})", conn.state());
+        }
+        let status = control::Status {
+            peer_name: Some(trusted.name.clone()),
+            peer_present: beacon_present,
+            bound: matches!(conn.state(), State::Bound),
+            paused,
+        };
+        if let Err(e) = control::write_status(&args.control_dir, &status) {
+            eprintln!("control: write_status failed: {e}");
+        }
+        std::thread::sleep(TICK_INTERVAL);
+    }
+
+    eprintln!("shutdown signal — unbinding");
+    let _ = conn.tick(false, &mut runner);
+    let _ = control::clear_status(&args.control_dir);
+}
+
+pub fn run_pair(state_dir: &std::path::Path) {
+    let sock = match UdpSocket::bind((Ipv4Addr::UNSPECIFIED, BEACON_PORT)) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("bind for pair: {e}");
+            std::process::exit(1);
+        }
+    };
+    sock.set_broadcast(true).ok();
+    let identity = Arc::new(
+        discovery::identity::load_or_generate(state_dir).unwrap_or_else(|e| {
+            eprintln!("identity load: {e:?}");
+            std::process::exit(1);
+        }),
+    );
+    let cfg = discovery::pair::PairConfig {
+        identity: identity.clone(),
+        recv_sock: sock,
+        targets: discovery::netifs::broadcast_targets(BEACON_PORT),
+        self_name: super::hostname(),
+        state_dir: state_dir.to_path_buf(),
+        timeout: Duration::from_secs(120),
+    };
+    eprintln!(
+        "pairing — fingerprint {}; waiting up to 120 s",
+        identity.fingerprint_str()
+    );
+    let mut stdin = std::io::stdin();
+    let mut stderr = std::io::stderr();
+    match discovery::pair::run_pair(&cfg, &mut stdin, &mut stderr) {
+        discovery::pair::PairOutcome::Paired(p) => {
+            eprintln!("paired with {} (fingerprint stored)", p.name);
+        }
+        other => {
+            eprintln!("pair did not complete: {other:?}");
+            std::process::exit(1);
+        }
+    }
+}
+

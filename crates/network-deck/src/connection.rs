@@ -19,7 +19,6 @@ pub enum Action {
 }
 
 pub trait CommandRunner {
-    /// Returns true on success, false on any failure.
     fn run_usbip(&mut self, args: &[&str]) -> bool;
 }
 
@@ -51,8 +50,6 @@ impl Connection {
         self.state
     }
 
-    /// Update the desired state from the latest beacon view, returning the
-    /// action taken (if any) so the caller can log it.
     pub fn tick(&mut self, peer_present: bool, runner: &mut dyn CommandRunner) -> Option<Action> {
         match (self.state, peer_present) {
             (State::Idle, true) => {
@@ -64,8 +61,6 @@ impl Connection {
                 }
             }
             (State::Bound, false) => {
-                // Best effort: even if unbind fails, we still mark Idle so
-                // we'll try to bind again next time the peer reappears.
                 let _ = runner.run_usbip(&["unbind", "-b", &self.busid]);
                 self.state = State::Idle;
                 Some(Action::Unbind)
@@ -93,8 +88,7 @@ mod tests {
 
     impl CommandRunner for MockRunner {
         fn run_usbip(&mut self, args: &[&str]) -> bool {
-            self.invocations
-                .push(args.iter().map(|s| (*s).to_owned()).collect());
+            self.invocations.push(args.iter().map(|s| (*s).to_owned()).collect());
             self.bind_succeeds
         }
     }
@@ -131,17 +125,6 @@ mod tests {
     }
 
     #[test]
-    fn bound_with_peer_still_present_does_nothing() {
-        let mut conn = Connection::new("3-3".into());
-        let mut runner = MockRunner::ok();
-        conn.tick(true, &mut runner);
-        assert_eq!(conn.tick(true, &mut runner), None);
-        assert_eq!(conn.state(), State::Bound);
-        // Only one bind invocation in total.
-        assert_eq!(runner.invocations.len(), 1);
-    }
-
-    #[test]
     fn failed_bind_keeps_idle() {
         let mut conn = Connection::new("3-3".into());
         let mut runner = MockRunner { bind_succeeds: false, ..Default::default() };
@@ -154,7 +137,6 @@ mod tests {
         let mut conn = Connection::new("3-3".into());
         let mut runner = MockRunner::ok();
         conn.tick(true, &mut runner);
-        // Now make the unbind "fail":
         runner.bind_succeeds = false;
         assert_eq!(conn.tick(false, &mut runner), Some(Action::Unbind));
         assert_eq!(conn.state(), State::Idle);

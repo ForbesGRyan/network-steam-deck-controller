@@ -14,6 +14,7 @@ pub struct RemoteDevice {
 }
 
 #[derive(Debug)]
+#[allow(dead_code)] // payloads surface via Debug in logs; ParseFailed reserved for richer parsers
 pub enum CliError {
     NotInstalled,
     InvocationFailed(String),
@@ -164,6 +165,7 @@ impl UsbipCli {
     ///
     /// # Errors
     /// As [`UsbipCli::run`].
+    #[allow(dead_code)] // tray "disconnect" action not wired yet
     pub fn detach(&self, port: u8) -> Result<(), CliError> {
         self.run(&["detach", "-p", &port.to_string()]).map(|_| ())
     }

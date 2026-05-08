@@ -1,3 +1,0 @@
-# Network Deck control surface (status + paused flag)
-# Mode 0777 so the daemon (root) and kiosk (user) can both write.
-d /run/network-deck 0777 root root -

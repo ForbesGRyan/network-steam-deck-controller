@@ -46,7 +46,7 @@ pub struct Beacon {
     peer: Arc<TrustedPeer>,
     state: Arc<Mutex<PeerState>>,
     send_sock: UdpSocket,
-    broadcast_dest: SocketAddr,
+    broadcast_dests: Vec<SocketAddr>,
     session_key: [u8; SESSION_KEY_LEN],
     self_name: String,
     listen_port: u16,
@@ -65,7 +65,7 @@ impl Beacon {
     pub fn new(
         identity: Arc<Identity>,
         peer: Arc<TrustedPeer>,
-        broadcast_dest: SocketAddr,
+        broadcast_dests: Vec<SocketAddr>,
         self_name: String,
         listen_port: u16,
     ) -> Result<Self, BeaconError> {
@@ -76,7 +76,7 @@ impl Beacon {
             identity, peer,
             state: Arc::new(Mutex::new(PeerState::default())),
             send_sock,
-            broadcast_dest,
+            broadcast_dests,
             session_key,
             self_name,
             listen_port,
@@ -101,7 +101,15 @@ impl Beacon {
         let mut buf = [0_u8; PACKET_LEN];
         packet::sign_into(&self.identity.signing, &pkt, &mut buf)
             .map_err(|_| io::Error::other("sign failed"))?;
-        self.send_sock.send_to(&buf, self.broadcast_dest).map(|_| ())
+        let mut last_err: Option<io::Error> = None;
+        let mut sent = 0_usize;
+        for dest in &self.broadcast_dests {
+            match self.send_sock.send_to(&buf, dest) {
+                Ok(_) => sent += 1,
+                Err(e) => last_err = Some(e),
+            }
+        }
+        if sent > 0 { Ok(()) } else { Err(last_err.unwrap_or_else(|| io::Error::other("no targets"))) }
     }
 
     /// Handle one inbound beacon packet. Called by the data-plane recv loop
@@ -189,7 +197,7 @@ mod tests {
         let them = make_identity();
         let peer = make_peer(them.pubkey);
         let dest = "127.0.0.1:1".parse().unwrap();
-        let beacon = Beacon::new(me, peer.clone(), dest, "me".into(), 49152).unwrap();
+        let beacon = Beacon::new(me, peer.clone(), vec![dest], "me".into(), 49152).unwrap();
 
         let pkt = BeaconPacket {
             flags: 0,
@@ -215,7 +223,7 @@ mod tests {
         let stranger = make_identity();
         let peer = make_peer(them.pubkey);
         let dest = "127.0.0.1:1".parse().unwrap();
-        let beacon = Beacon::new(me, peer, dest, "me".into(), 49152).unwrap();
+        let beacon = Beacon::new(me, peer, vec![dest], "me".into(), 49152).unwrap();
 
         let pkt = BeaconPacket {
             flags: 0,
@@ -237,7 +245,7 @@ mod tests {
         let them = make_identity();
         let peer = make_peer(them.pubkey);
         let dest = "127.0.0.1:1".parse().unwrap();
-        let beacon = Beacon::new(me, peer.clone(), dest, "me".into(), 49152).unwrap();
+        let beacon = Beacon::new(me, peer.clone(), vec![dest], "me".into(), 49152).unwrap();
         let pkt = BeaconPacket {
             flags: 0,
             pubkey: them.pubkey,
@@ -258,7 +266,7 @@ mod tests {
         let third = make_identity();
         let peer = make_peer(them.pubkey);
         let dest = "127.0.0.1:1".parse().unwrap();
-        let beacon = Beacon::new(me, peer.clone(), dest, "me".into(), 49152).unwrap();
+        let beacon = Beacon::new(me, peer.clone(), vec![dest], "me".into(), 49152).unwrap();
         // Beacon names the third party's fingerprint — must be dropped even
         // though the packet is properly signed by the trusted peer.
         let pkt = BeaconPacket {

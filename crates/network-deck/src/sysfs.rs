@@ -1,14 +1,9 @@
 //! Find the Deck controller's USB busid by walking sysfs.
-//!
-//! The busid (e.g. `3-3`) can change across reboots. usbip operates on
-//! busids, not VID/PID, so we need a lookup at startup.
 
 use std::fs;
 use std::io;
 use std::path::Path;
 
-/// Steam Deck internal controller VID/PID — both old LCD and OLED revs
-/// expose the same identifier here.
 pub const DECK_VID: &str = "28de";
 pub const DECK_PID: &str = "1205";
 
@@ -19,23 +14,12 @@ pub enum SysfsError {
 }
 
 impl From<io::Error> for SysfsError {
-    fn from(e: io::Error) -> Self {
-        Self::Io(e)
-    }
+    fn from(e: io::Error) -> Self { Self::Io(e) }
 }
 
-/// Walk `<root>/bus/usb/devices/*` looking for a directory with matching
-/// `idVendor` + `idProduct`. Returns the busid (the directory name).
-///
-/// `root` is `/sys` in production; tests pass a tempdir.
-///
-/// # Errors
-/// `SysfsError::Io` for filesystem errors. `SysfsError::NotFound` if no
-/// matching device is present.
 pub fn find_deck_busid(root: &Path, vid: &str, pid: &str) -> Result<String, SysfsError> {
     let dir = root.join("bus/usb/devices");
-    let entries = fs::read_dir(&dir)?;
-    for entry in entries {
+    for entry in fs::read_dir(&dir)? {
         let entry = entry?;
         let path = entry.path();
         if read_trim(&path.join("idVendor")).as_deref() == Some(vid)
@@ -93,11 +77,9 @@ mod tests {
     #[test]
     fn ignores_directories_missing_vid_pid_files() {
         let root = tempdir().unwrap();
-        // Hub-style device directories sometimes have only idVendor.
         let dir = root.path().join("bus/usb/devices/usb1");
         fs::create_dir_all(&dir).unwrap();
         fs::write(dir.join("idVendor"), "1d6b\n").unwrap();
-        // No idProduct.
         make_device(root.path(), "3-3", DECK_VID, DECK_PID);
         let busid = find_deck_busid(root.path(), DECK_VID, DECK_PID).unwrap();
         assert_eq!(busid, "3-3");

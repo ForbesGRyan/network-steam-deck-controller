@@ -61,10 +61,10 @@ command = "cargo"
 args = ["build", "--workspace", "--release"]
 
 [tasks.build-deck]
-description = "Release build of server-deck + kiosk-deck (Linux only)"
+description = "Release build of the unified network-deck binary (Linux only)"
 condition = { platforms = ["linux"] }
 command = "cargo"
-args = ["build", "--release", "-p", "server-deck", "-p", "kiosk-deck"]
+args = ["build", "--release", "-p", "network-deck"]
 
 [tasks.build-win]
 description = "Release build of client-win (Windows only)"
@@ -75,13 +75,13 @@ args = ["build", "--release", "-p", "client-win"]
 # ---------------------------------------------------------------- install
 
 [tasks.install-deck]
-description = "Build Deck binaries + run the Deck installer (Linux, needs sudo)"
+description = "Build network-deck + run its built-in first-run installer (Linux, needs sudo)"
 condition = { platforms = ["linux"] }
 dependencies = ["build-deck"]
 script = '''
 #!/usr/bin/env bash
 set -euo pipefail
-sudo bash scripts/install-deck.sh
+sudo ./target/release/network-deck install
 '''
 
 [tasks.install-win]
@@ -103,7 +103,8 @@ condition = { platforms = ["linux"] }
 script = '''
 #!/usr/bin/env bash
 set -euo pipefail
-sudo /usr/local/bin/server-deck pair --state-dir /var/lib/network-deck
+DECK_USER="${SUDO_USER:-$USER}"
+sudo /home/${DECK_USER}/network-deck/network-deck pair
 '''
 
 [tasks.pair-win]
@@ -116,23 +117,3 @@ $ErrorActionPreference = "Stop"
 & "$env:LOCALAPPDATA\NetworkDeck\client-win.exe" pair
 '''
 
-# ---------------------------------------------------------------- service
-
-[tasks.deck-service-restart]
-description = "Restart the network-deck-server systemd unit (Linux, needs sudo)"
-condition = { platforms = ["linux"] }
-script = '''
-#!/usr/bin/env bash
-set -euo pipefail
-sudo systemctl restart network-deck-server.service
-sudo systemctl status --no-pager network-deck-server.service
-'''
-
-[tasks.deck-status]
-description = "Tail the Deck daemon log (Linux)"
-condition = { platforms = ["linux"] }
-script = '''
-#!/usr/bin/env bash
-set -euo pipefail
-journalctl -u network-deck-server.service -f
-'''

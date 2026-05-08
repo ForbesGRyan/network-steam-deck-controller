@@ -6,13 +6,63 @@
 
 use std::net::{Ipv4Addr, SocketAddr, UdpSocket};
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
+
+/// Stoppable beacon recv thread. Holds the bound `UdpSocket` for its
+/// lifetime; on `stop()` returns the socket back to the caller so the pair
+/// flow can take it over without re-binding 49152 (which fails — we already
+/// hold it). Recv uses a 500 ms read timeout so the stop flag is observed
+/// promptly.
+struct RecvThread {
+    stop: Arc<AtomicBool>,
+    handle: JoinHandle<UdpSocket>,
+}
+
+impl RecvThread {
+    fn spawn(sock: UdpSocket, beacon: Arc<discovery::Beacon>) -> Self {
+        let stop = Arc::new(AtomicBool::new(false));
+        let stop2 = stop.clone();
+        let handle = std::thread::Builder::new()
+            .name("discovery-recv".into())
+            .spawn(move || {
+                let _ = sock.set_read_timeout(Some(Duration::from_millis(500)));
+                let mut buf = [0_u8; discovery::packet::PACKET_LEN];
+                while !stop2.load(Ordering::Relaxed) {
+                    match sock.recv_from(&mut buf) {
+                        Ok((n, src)) => {
+                            if n >= 4 && buf[0..4] == discovery::BEACON_MAGIC {
+                                beacon.handle_packet(src, &buf[..n]);
+                            }
+                        }
+                        Err(e)
+                            if matches!(
+                                e.kind(),
+                                std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                            ) => {}
+                        Err(_) => {}
+                    }
+                }
+                sock
+            })
+            .expect("spawn discovery-recv");
+        Self { stop, handle }
+    }
+
+    fn stop(self) -> UdpSocket {
+        self.stop.store(true, Ordering::Relaxed);
+        self.handle.join().expect("recv thread panicked")
+    }
+}
 
 #[cfg(windows)]
 mod attach;
 #[cfg(windows)]
 mod autostart;
+#[cfg(windows)]
+mod pair_dialog;
 #[cfg(windows)]
 mod tray;
 #[cfg(windows)]
@@ -93,8 +143,15 @@ fn run_normal(identity: &Arc<discovery::Identity>, state_dir: &std::path::Path) 
     let trusted = match discovery::trust::load(state_dir) {
         Ok(Some(p)) => Arc::new(p),
         Ok(None) => {
-            eprintln!("no trusted peer; run `client-win pair` to pair first");
-            std::process::exit(1);
+            #[cfg(windows)]
+            {
+                first_run_pair(identity.clone(), state_dir);
+            }
+            #[cfg(not(windows))]
+            {
+                eprintln!("no trusted peer; run `client-win pair` to pair first");
+                std::process::exit(1);
+            }
         }
         Err(e) => {
             eprintln!("trust load: {e:?}");
@@ -111,7 +168,7 @@ fn run_normal(identity: &Arc<discovery::Identity>, state_dir: &std::path::Path) 
         discovery::Beacon::new(
             identity.clone(),
             trusted.clone(),
-            SocketAddr::new(Ipv4Addr::BROADCAST.into(), DEFAULT_PORT),
+            discovery::netifs::broadcast_targets(DEFAULT_PORT),
             hostname(),
             DEFAULT_PORT,
         )
@@ -122,20 +179,7 @@ fn run_normal(identity: &Arc<discovery::Identity>, state_dir: &std::path::Path) 
     );
     discovery::beacon::spawn_broadcast(beacon.clone());
 
-    let beacon_recv = beacon.clone();
-    std::thread::Builder::new()
-        .name("discovery-recv".into())
-        .spawn(move || {
-            let mut buf = [0_u8; discovery::packet::PACKET_LEN];
-            loop {
-                if let Ok((n, src)) = bound.recv_from(&mut buf) {
-                    if n >= 4 && buf[0..4] == discovery::BEACON_MAGIC {
-                        beacon_recv.handle_packet(src, &buf[..n]);
-                    }
-                }
-            }
-        })
-        .ok();
+    let recv = RecvThread::spawn(bound, beacon.clone());
 
     eprintln!(
         "client-win running — paired with {} (fingerprint {})",
@@ -144,7 +188,10 @@ fn run_normal(identity: &Arc<discovery::Identity>, state_dir: &std::path::Path) 
     );
 
     #[cfg(windows)]
-    run_attach_loop(&beacon);
+    run_attach_loop(&beacon, recv, identity.clone(), state_dir.to_path_buf());
+
+    #[cfg(not(windows))]
+    let _ = recv;
 
     #[cfg(not(windows))]
     {
@@ -156,7 +203,12 @@ fn run_normal(identity: &Arc<discovery::Identity>, state_dir: &std::path::Path) 
 }
 
 #[cfg(windows)]
-fn run_attach_loop(beacon: &Arc<discovery::Beacon>) {
+fn run_attach_loop(
+    beacon: &Arc<discovery::Beacon>,
+    mut recv: RecvThread,
+    identity: Arc<discovery::Identity>,
+    state_dir: PathBuf,
+) {
     use crate::attach::{Attach, State, UsbipDriver};
     use crate::tray::TrayEvent;
     use crate::usbip_cli::{CliError, UsbipCli};
@@ -211,7 +263,49 @@ fn run_attach_loop(beacon: &Arc<discovery::Beacon>) {
                     eprintln!("tray: disconnect (paused until Connect)");
                 }
                 TrayEvent::Pair => {
-                    eprintln!("tray: pair (run `client-win pair` from a shell — TODO inline UI)");
+                    eprintln!("tray: pair — handing socket to pair dialog");
+                    tray_handle.set_tooltip("Network Deck — pairing…");
+                    // Stop the recv thread so the pair flow can use the
+                    // 49152 socket without conflict. recv.stop() returns
+                    // the socket; we hand it to pair_dialog.
+                    let sock = recv.stop();
+                    let outcome = pair_dialog::run(
+                        sock,
+                        identity.clone(),
+                        hostname(),
+                        &state_dir,
+                    );
+                    match outcome {
+                        discovery::pair::PairOutcome::Paired(_) => {
+                            // Re-exec to pick up the new trust file cleanly.
+                            // Drop the tray + driver state by exiting.
+                            eprintln!("pair complete — restarting");
+                            if let Ok(exe) = std::env::current_exe() {
+                                let _ = std::process::Command::new(exe).spawn();
+                            }
+                            std::process::exit(0);
+                        }
+                        other => {
+                            eprintln!("pair did not complete: {other:?}");
+                            // Re-bind & resume normal operation. We can't
+                            // reuse the socket (pair_dialog::run consumed
+                            // it) so re-bind 49152.
+                            let bind_addr = SocketAddr::new(
+                                Ipv4Addr::UNSPECIFIED.into(),
+                                DEFAULT_PORT,
+                            );
+                            match UdpSocket::bind(bind_addr) {
+                                Ok(s) => {
+                                    recv = RecvThread::spawn(s, beacon.clone());
+                                    tray_handle.set_tooltip("Network Deck — searching");
+                                }
+                                Err(e) => {
+                                    eprintln!("re-bind {bind_addr}: {e}");
+                                    std::process::exit(1);
+                                }
+                            }
+                        }
+                    }
                 }
                 TrayEvent::Quit => {
                     eprintln!("tray: quit");
@@ -246,6 +340,56 @@ fn run_attach_loop(beacon: &Arc<discovery::Beacon>) {
     }
 }
 
+/// First-run pair. Binds 49152, hands the socket to `pair_dialog`, and on
+/// success re-execs ourselves so the freshly-written trust file is picked
+/// up cleanly on the next launch. Always diverges.
+#[cfg(windows)]
+fn first_run_pair(identity: Arc<discovery::Identity>, state_dir: &std::path::Path) -> ! {
+    use windows_sys::Win32::UI::WindowsAndMessaging::{
+        MessageBoxW, MB_ICONINFORMATION, MB_OK,
+    };
+
+    // Heads-up dialog so the user can put the Deck in pair mode before we
+    // start broadcasting. The pair flow has its own 120 s timeout once we
+    // proceed; this dialog is the chance to hit Cancel via window close.
+    let title = "Network Deck — first-time pair"
+        .encode_utf16().chain(std::iter::once(0)).collect::<Vec<_>>();
+    let body = "No paired Deck found.\n\n\
+                On the Deck, launch Network Deck and tap \"Start pairing\".\n\
+                Click OK to start pairing on this PC."
+        .encode_utf16().chain(std::iter::once(0)).collect::<Vec<_>>();
+    // SAFETY: NUL-terminated UTF-16 strings, null hwnd, valid flags.
+    unsafe {
+        MessageBoxW(
+            std::ptr::null_mut(),
+            body.as_ptr(),
+            title.as_ptr(),
+            MB_OK | MB_ICONINFORMATION,
+        );
+    }
+
+    let bind_addr = SocketAddr::new(Ipv4Addr::UNSPECIFIED.into(), DEFAULT_PORT);
+    let sock = UdpSocket::bind(bind_addr).unwrap_or_else(|e| {
+        eprintln!("bind {bind_addr}: {e}");
+        std::process::exit(1);
+    });
+
+    let outcome = pair_dialog::run(sock, identity, hostname(), state_dir);
+    match outcome {
+        discovery::pair::PairOutcome::Paired(_) => {
+            // Re-exec so run_normal hits the trust-loaded branch.
+            if let Ok(exe) = std::env::current_exe() {
+                let _ = std::process::Command::new(exe).spawn();
+            }
+            std::process::exit(0);
+        }
+        other => {
+            eprintln!("pair did not complete: {other:?}");
+            std::process::exit(1);
+        }
+    }
+}
+
 fn hostname() -> String {
     std::env::var("COMPUTERNAME")
         .or_else(|_| std::env::var("HOSTNAME"))
@@ -264,7 +408,7 @@ fn run_pair_mode(identity: &Arc<discovery::Identity>, state_dir: &std::path::Pat
     let cfg = discovery::pair::PairConfig {
         identity: identity.clone(),
         recv_sock: sock,
-        unicast_target: SocketAddr::new(Ipv4Addr::BROADCAST.into(), DEFAULT_PORT),
+        targets: discovery::netifs::broadcast_targets(DEFAULT_PORT),
         self_name: hostname(),
         state_dir: state_dir.to_path_buf(),
         timeout: Duration::from_secs(120),

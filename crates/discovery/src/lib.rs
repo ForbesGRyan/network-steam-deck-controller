@@ -1,6 +1,6 @@
 //! LAN discovery + first-time pairing.
 //!
-//! Two binaries (`server-deck` on the Deck, `client-win` on Windows) run
+//! Two binaries (`network-deck` on the Deck, `client-win` on Windows) run
 //! the same beacon: sign a small UDP packet with our Ed25519 key, broadcast
 //! it on the data port, and listen for the peer's matching announce. After a
 //! one-shot `pair` flow with mutual button-press confirmation, both ends
@@ -11,6 +11,7 @@
 pub mod beacon;
 pub mod crypto;
 pub mod identity;
+pub mod netifs;
 pub mod packet;
 pub mod pair;
 pub mod state_dir;

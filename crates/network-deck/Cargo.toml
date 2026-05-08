@@ -1,0 +1,28 @@
+[package]
+name = "network-deck"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+description = "Steam Deck side: single binary — kiosk UI, supervised daemon, pair flow, and first-run installer"
+
+[[bin]]
+name = "network-deck"
+path = "src/main.rs"
+
+[dependencies]
+discovery = { path = "../discovery" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[target.'cfg(target_os = "linux")'.dependencies]
+eframe = { version = "0.32", default-features = false, features = ["default_fonts", "glow", "wayland", "x11"] }
+egui = "0.32"
+libc = "0.2"
+signal-hook = { version = "0.3", default-features = false }
+evdev = "0.13"
+
+[dev-dependencies]
+tempfile = "3"
+
+[lints]
+workspace = true

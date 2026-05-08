@@ -32,7 +32,7 @@ fn mutual_accept_writes_both_trust_files() {
     let cfg_a = PairConfig {
         identity: id_a.clone(),
         recv_sock: sock_a,
-        unicast_target: addr_b,
+        targets: vec![addr_b],
         self_name: "a".into(),
         state_dir: dir_a.path().to_path_buf(),
         timeout: Duration::from_secs(10),
@@ -40,7 +40,7 @@ fn mutual_accept_writes_both_trust_files() {
     let cfg_b = PairConfig {
         identity: id_b.clone(),
         recv_sock: sock_b,
-        unicast_target: addr_a,
+        targets: vec![addr_a],
         self_name: "b".into(),
         state_dir: dir_b.path().to_path_buf(),
         timeout: Duration::from_secs(10),
@@ -72,7 +72,7 @@ fn one_side_declines_neither_writes_trust() {
     let cfg_a = PairConfig {
         identity: id_a.clone(),
         recv_sock: sock_a,
-        unicast_target: addr_b,
+        targets: vec![addr_b],
         self_name: "a".into(),
         state_dir: dir_a.path().to_path_buf(),
         timeout: Duration::from_secs(3),
@@ -80,7 +80,7 @@ fn one_side_declines_neither_writes_trust() {
     let cfg_b = PairConfig {
         identity: id_b.clone(),
         recv_sock: sock_b,
-        unicast_target: addr_a,
+        targets: vec![addr_a],
         self_name: "b".into(),
         state_dir: dir_b.path().to_path_buf(),
         timeout: Duration::from_secs(3),
@@ -111,7 +111,7 @@ fn timeout_with_no_peer_writes_no_trust() {
     let cfg_a = PairConfig {
         identity: id_a,
         recv_sock: sock_a,
-        unicast_target: nowhere,
+        targets: vec![nowhere],
         self_name: "a".into(),
         state_dir: dir_a.path().to_path_buf(),
         timeout: Duration::from_secs(1),
