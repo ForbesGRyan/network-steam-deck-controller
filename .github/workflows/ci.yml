@@ -9,8 +9,8 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  lint:
-    name: clippy (linux)
+  clippy-linux:
+    name: clippy (linux — discovery + network-deck)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -25,7 +25,18 @@ jobs:
             libxkbcommon-dev libwayland-dev \
             libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev libxcb1-dev \
             libfontconfig1-dev
-      - run: cargo clippy --workspace --all-targets -- -D warnings
+      - run: cargo clippy -p discovery -p network-deck --all-targets -- -D warnings
+
+  clippy-windows:
+    name: clippy (windows — discovery + client-win)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo clippy -p discovery -p client-win --all-targets -- -D warnings
 
   test-linux:
     name: test (linux)
