@@ -95,6 +95,7 @@ mod linux {
         mode: Mode,
         state_dir: PathBuf,
         sysfs_root: PathBuf,
+        control_dir: PathBuf,
     }
 
     fn parse_args() -> ParsedArgs {
@@ -102,6 +103,7 @@ mod linux {
         let mut mode = Mode::Run;
         let mut state_dir_override: Option<PathBuf> = None;
         let mut sysfs_root_override: Option<PathBuf> = None;
+        let mut control_dir_override: Option<PathBuf> = None;
         while let Some(a) = args.next() {
             match a.as_str() {
                 "pair" => mode = Mode::Pair,
@@ -120,6 +122,13 @@ mod linux {
                         std::process::exit(2);
                     }
                 }
+                "--control-dir" => {
+                    control_dir_override = args.next().map(PathBuf::from);
+                    if control_dir_override.is_none() {
+                        eprintln!("--control-dir requires a value");
+                        std::process::exit(2);
+                    }
+                }
                 other => {
                     eprintln!("unexpected argument: {other}");
                     std::process::exit(2);
@@ -133,7 +142,8 @@ mod linux {
             })
         });
         let sysfs_root = sysfs_root_override.unwrap_or_else(|| PathBuf::from("/sys"));
-        ParsedArgs { mode, state_dir, sysfs_root }
+        let control_dir = control_dir_override.unwrap_or_else(|| PathBuf::from("/run/network-deck"));
+        ParsedArgs { mode, state_dir, sysfs_root, control_dir }
     }
 
     pub fn run() {
@@ -216,10 +226,22 @@ mod linux {
         let mut conn = Connection::new(busid.clone());
         let mut runner = RealRunner;
         loop {
-            let peer_present = beacon.current_peer_with_age()
+            let beacon_present = beacon.current_peer_with_age()
                 .is_some_and(|(_, age)| age <= discovery::beacon::STALE_AFTER);
-            if let Some(action) = conn.tick(peer_present, &mut runner) {
+            let paused = crate::control::is_paused(&args.control_dir);
+            let effective_peer_present = beacon_present && !paused;
+            if let Some(action) = conn.tick(effective_peer_present, &mut runner) {
                 eprintln!("connection: {action:?} (state={:?})", conn.state());
+            }
+            let status = crate::control::Status {
+                peer_name: Some(trusted.name.clone()),
+                peer_present: beacon_present, // raw beacon, NOT effective — UI distinguishes "Connected but paused" from "Searching"
+                bound: matches!(conn.state(), crate::connection::State::Bound),
+                paused,
+            };
+            if let Err(e) = crate::control::write_status(&args.control_dir, &status) {
+                // Log once and keep going — kiosk just shows stale info, daemon must not crash on a missing /run dir
+                eprintln!("control: write_status failed: {e}");
             }
             std::thread::sleep(TICK_INTERVAL);
         }
