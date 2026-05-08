@@ -20,6 +20,8 @@ use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
+use crate::install::absolute_path_for;
+
 /// Shared, GUI-visible view of the daemon child.
 #[derive(Default)]
 pub struct DaemonState {
@@ -76,24 +78,18 @@ pub struct DaemonChild {
 /// How to escalate when launching the daemon.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Escalation {
-    /// Direct exec. Assumes the installed binary is setuid root, which
-    /// the installer ensures. Cleanest path: no sudo or pkexec layer,
-    /// no auth prompts, daemon runs as root via the kernel's setuid bit.
-    Direct,
     /// `sudo -n` — silent, requires the NOPASSWD sudoers entry the
-    /// installer also writes (defense in depth if setuid is stripped).
-    #[allow(dead_code)] // reserved fallback; spawn path is wired but no caller selects it yet
+    /// installer writes. Default path post-setuid-removal.
     SudoNonInteractive,
-    /// `pkexec` — pops the system-wide polkit auth dialog. Last-resort
-    /// fallback for when both setuid and sudo are unavailable.
+    /// `pkexec` — pops the system-wide polkit auth dialog. Fallback when
+    /// sudo isn't usable (no NOPASSWD entry, sudo binary missing, etc.).
     Pkexec,
 }
 
 impl DaemonChild {
-    /// Spawn the daemon via direct exec (relies on setuid bit) and start
-    /// the helper threads.
+    /// Spawn the daemon via `sudo -n` (the default escalation path).
     pub fn spawn(self_exe: &Path) -> std::io::Result<(Self, Arc<DaemonState>)> {
-        Self::spawn_with(self_exe, Escalation::Direct)
+        Self::spawn_with(self_exe, Escalation::SudoNonInteractive)
     }
 
     pub fn spawn_with(
@@ -101,15 +97,34 @@ impl DaemonChild {
         method: Escalation,
     ) -> std::io::Result<(Self, Arc<DaemonState>)> {
         let mut cmd = match method {
-            Escalation::Direct => Command::new(self_exe),
             Escalation::SudoNonInteractive => {
-                let mut c = Command::new("sudo");
+                let sudo = absolute_path_for("sudo").ok_or_else(|| {
+                    std::io::Error::other("sudo not found in /usr/bin or /bin")
+                })?;
+                let mut c = Command::new(sudo);
                 c.arg("-n").arg(self_exe);
                 c
             }
             Escalation::Pkexec => {
-                let mut c = Command::new("pkexec");
-                c.arg(self_exe);
+                // pkexec runs the target as root — refuse if `self_exe`
+                // sits in a user-writable tree (e.g. $HOME), otherwise
+                // any local user can trojan the binary and ride pkexec.
+                let canonical = self_exe
+                    .canonicalize()
+                    .unwrap_or_else(|_| self_exe.to_path_buf());
+                if canonical != Path::new(crate::install::INSTALL_BIN)
+                    && !canonical.starts_with("/usr/")
+                {
+                    return Err(std::io::Error::other(format!(
+                        "refusing to pkexec a binary outside the system tree: {}",
+                        canonical.display()
+                    )));
+                }
+                let pkexec = absolute_path_for("pkexec").ok_or_else(|| {
+                    std::io::Error::other("pkexec not found in /usr/bin or /bin")
+                })?;
+                let mut c = Command::new(pkexec);
+                c.arg(&canonical);
                 c
             }
         };
@@ -157,17 +172,18 @@ impl DaemonChild {
 
 impl Drop for DaemonChild {
     fn drop(&mut self) {
-        // SIGTERM the daemon — its signal handler triggers `usbip unbind`
-        // and clears /run/.../status.json before exiting.
-        unsafe {
-            #[allow(clippy::cast_possible_wrap)]
-            libc::kill(self.pid as i32, libc::SIGTERM);
+        let Some(handle) = self.waiter.take() else { return };
+        // PID-reuse safe: only signal if the waiter hasn't already reaped.
+        if !handle.is_finished() {
+            unsafe {
+                #[allow(clippy::cast_possible_wrap)]
+                libc::kill(self.pid as i32, libc::SIGTERM);
+            }
         }
         // Wait up to 5 s for the daemon to actually exit — this is what
         // releases the controller back to the Deck. `usbip unbind` shells
         // out to the userspace tool, so it can take ~hundreds of ms even
         // on a fast machine.
-        let Some(handle) = self.waiter.take() else { return };
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
         while std::time::Instant::now() < deadline {
             if handle.is_finished() { break; }

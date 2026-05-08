@@ -18,7 +18,7 @@
 //! taken from `$SUDO_USER` (the user who invoked sudo) — falls back to
 //! `deck` if missing.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
 const SUDOERS_PATH: &str = "/etc/sudoers.d/network-deck";
@@ -36,7 +36,14 @@ pub fn run() -> std::io::Result<()> {
     }
 
     let user = std::env::var("SUDO_USER").unwrap_or_else(|_| "deck".to_owned());
-    let home = home_for(&user).unwrap_or_else(|| PathBuf::from(format!("/home/{user}")));
+    if !is_valid_username(&user) {
+        eprintln!("install: refusing untrusted SUDO_USER={user:?}");
+        std::process::exit(1);
+    }
+    let Some(home) = home_for(&user) else {
+        eprintln!("install: user {user:?} not found in passwd");
+        std::process::exit(1);
+    };
     let install_dir = PathBuf::from(INSTALL_DIR);
     let install_bin = PathBuf::from(INSTALL_BIN);
     let app_dir = home.join(".local/share/applications");
@@ -53,12 +60,11 @@ pub fn run() -> std::io::Result<()> {
     copy_self_to(&install_bin)?;
     chown(&install_dir, "root", "root")?;
     chmod(&install_dir, 0o755)?;
-    // 04755 = setuid + 0755. The kernel runs the binary as root regardless
-    // of who invokes it, so the kiosk (running as the deck user) can spawn
-    // `network-deck daemon` directly without sudo or pkexec. The binary
-    // itself drops privs back to the real user for non-privileged
-    // subcommands (gui, pair) — see `drop_privs_if_setuid` in main.
-    chmod(&install_bin, 0o4755)?;
+    // Plain 0o755. Setuid root was removed: paired with bare-name
+    // Command::new() calls inside the daemon, it lets any local user
+    // hijack PATH and execute as root. The sudoers NOPASSWD entry below
+    // is the sole privilege-escalation path.
+    chmod(&install_bin, 0o755)?;
     write_sudoers(&user, &install_bin)?;
     write_desktop(&user, &app_dir, &desktop_path, &install_bin)?;
 
@@ -82,8 +88,24 @@ fn is_root() -> bool {
     unsafe { libc::getuid() == 0 }
 }
 
+/// POSIX portable username syntax: `^[a-z_][a-z0-9_-]*$`. Refuses newlines,
+/// shell metas, and anything else that could escape the sudoers `format!`.
+#[must_use]
+pub fn is_valid_username(user: &str) -> bool {
+    if user.is_empty() || user.len() > 32 {
+        return false;
+    }
+    let mut chars = user.chars();
+    let Some(first) = chars.next() else { return false };
+    if !(first.is_ascii_lowercase() || first == '_') {
+        return false;
+    }
+    chars.all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_' || c == '-')
+}
+
 fn home_for(user: &str) -> Option<PathBuf> {
-    Command::new("getent")
+    let getent = absolute_path_for("getent")?;
+    Command::new(getent)
         .args(["passwd", user])
         .output()
         .ok()
@@ -148,7 +170,8 @@ fn enable_usbipd() {
 
 fn disable_old_systemd_unit() {
     let unit = "network-deck-server.service";
-    let exists = Command::new("systemctl")
+    let Some(systemctl) = absolute_path_for("systemctl") else { return };
+    let exists = Command::new(systemctl)
         .args(["list-unit-files", unit])
         .output()
         .map(|o| String::from_utf8_lossy(&o.stdout).contains(unit))
@@ -174,10 +197,8 @@ fn copy_self_to(dest: &std::path::Path) -> std::io::Result<()> {
 }
 
 fn write_sudoers(user: &str, install_bin: &std::path::Path) -> std::io::Result<()> {
-    // Strict sudoers form — exact arg match. Daemon and pair both take no
-    // CLI args; the daemon derives its control dir from $SUDO_UID and its
-    // state dir from HOME (which sudo resets to /root). This keeps the
-    // privilege scope narrow and predictable.
+    // `user` is validated by `is_valid_username` upstream (POSIX syntax) — the
+    // format! below cannot be smuggled through with newlines or sudoers metas.
     let body = format!(
         "# Allow {user} to launch the network-deck daemon without a password\n\
          # prompt. The daemon needs root for usbip bind/unbind on sysfs.\n\
@@ -233,8 +254,28 @@ fn chmod(path: &std::path::Path, mode: u32) -> std::io::Result<()> {
     Ok(())
 }
 
+/// Resolve a privileged tool name to an absolute path on `KNOWN_BIN_DIRS`.
+/// Returns `None` if no candidate exists. Bare-name `Command::new(...)` calls
+/// would inherit the caller's `$PATH`, which is attacker-controlled.
+const KNOWN_BIN_DIRS: &[&str] = &["/usr/sbin", "/usr/bin", "/sbin", "/bin"];
+
+#[must_use]
+pub fn absolute_path_for(cmd: &str) -> Option<PathBuf> {
+    for dir in KNOWN_BIN_DIRS {
+        let candidate = Path::new(dir).join(cmd);
+        if candidate.is_file() {
+            return Some(candidate);
+        }
+    }
+    None
+}
+
 fn run_ok(cmd: &str, args: &[&str]) -> bool {
-    Command::new(cmd)
+    let Some(abs) = absolute_path_for(cmd) else {
+        eprintln!("warning: {cmd} not found in any of {KNOWN_BIN_DIRS:?}");
+        return false;
+    };
+    Command::new(abs)
         .args(args)
         .status()
         .map(|s| s.success())
@@ -242,14 +283,36 @@ fn run_ok(cmd: &str, args: &[&str]) -> bool {
 }
 
 fn which_present(cmd: &str) -> bool {
-    Command::new("sh")
-        .args(["-c", &format!("command -v {cmd}")])
-        .status()
-        .map(|s| s.success())
-        .unwrap_or(false)
+    absolute_path_for(cmd).is_some()
 }
 
 #[must_use]
 pub fn is_installed() -> bool {
     std::path::Path::new(SUDOERS_PATH).exists()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn valid_usernames_accepted() {
+        assert!(is_valid_username("deck"));
+        assert!(is_valid_username("_admin"));
+        assert!(is_valid_username("a"));
+        assert!(is_valid_username("user-1"));
+        assert!(is_valid_username("u_2"));
+    }
+
+    #[test]
+    fn invalid_usernames_rejected() {
+        assert!(!is_valid_username(""));
+        assert!(!is_valid_username("1user"));
+        assert!(!is_valid_username("-user"));
+        assert!(!is_valid_username("Deck"));
+        assert!(!is_valid_username("deck\nroot ALL=(ALL) NOPASSWD:ALL"));
+        assert!(!is_valid_username("user name"));
+        assert!(!is_valid_username("user$"));
+        assert!(!is_valid_username("a".repeat(33).as_str()));
+    }
 }

@@ -23,6 +23,8 @@ mod daemon;
 #[cfg(target_os = "linux")]
 mod daemon_child;
 #[cfg(target_os = "linux")]
+mod firewall;
+#[cfg(target_os = "linux")]
 mod hotkey;
 #[cfg(target_os = "linux")]
 mod install;
@@ -49,15 +51,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     if args.next().is_some() {
         eprintln!("network-deck: subcommands take no extra arguments");
         std::process::exit(2);
-    }
-
-    // The installed binary is setuid root. `daemon` and `install` need root
-    // (sysfs writes, /etc edits, /var/lib copy). Everything else (gui, pair)
-    // runs as the invoking user — drop privs immediately so the eframe app
-    // doesn't run as root, the trust file lands in the user's home, etc.
-    let needs_root = matches!(sub.as_deref(), Some("daemon") | Some("install"));
-    if !needs_root {
-        drop_privs_if_setuid();
     }
 
     match sub.as_deref() {
@@ -202,37 +195,14 @@ fn default_state_dir() -> std::path::PathBuf {
 /// `getent passwd <user>` → home dir. Returns `None` on any failure.
 #[cfg(target_os = "linux")]
 fn home_for_user(user: &str) -> Option<std::path::PathBuf> {
-    let out = std::process::Command::new("getent")
+    let getent = install::absolute_path_for("getent")?;
+    let out = std::process::Command::new(getent)
         .args(["passwd", user])
         .output()
         .ok()?;
     if !out.status.success() { return None; }
     let line = std::str::from_utf8(&out.stdout).ok()?.trim_end().to_owned();
     line.split(':').nth(5).map(std::path::PathBuf::from)
-}
-
-/// Permanently drop to the real user/group ids if we entered as setuid
-/// root. No-op when not setuid. Uses `setresuid`/`setresgid` so the saved
-/// uid is also reset — there's no way to re-elevate after this.
-#[cfg(target_os = "linux")]
-fn drop_privs_if_setuid() {
-    // SAFETY: bare libc calls; arguments are valid uid/gid_t values from
-    // getuid/getgid/geteuid (which can't fail).
-    unsafe {
-        let ruid = libc::getuid();
-        let rgid = libc::getgid();
-        let euid = libc::geteuid();
-        if euid == 0 && ruid != 0 {
-            if libc::setresgid(rgid, rgid, rgid) != 0 {
-                eprintln!("setresgid failed: {}", std::io::Error::last_os_error());
-                std::process::exit(1);
-            }
-            if libc::setresuid(ruid, ruid, ruid) != 0 {
-                eprintln!("setresuid failed: {}", std::io::Error::last_os_error());
-                std::process::exit(1);
-            }
-        }
-    }
 }
 
 /// True iff a `trusted-peers.toml` is already on disk (= we've paired).
