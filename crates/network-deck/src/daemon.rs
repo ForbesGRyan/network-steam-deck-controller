@@ -10,8 +10,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
-use crate::connection::{Connection, RealRunner, State};
+use crate::connection::{Action, Connection, RealRunner, State};
 use crate::control;
+use crate::firewall::PeerLock;
 use crate::sysfs::{find_deck_busid, DECK_PID, DECK_VID};
 
 const BEACON_PORT: u16 = 49152;
@@ -23,6 +24,7 @@ pub struct Args {
     pub control_dir: PathBuf,
 }
 
+#[allow(clippy::too_many_lines)] // run() is a top-level boot sequence; splitting it costs more readability than it saves
 pub fn run(args: Args) {
     let identity = Arc::new(
         discovery::identity::load_or_generate(&args.state_dir).unwrap_or_else(|e| {
@@ -102,6 +104,9 @@ pub fn run(args: Args) {
 
     let mut conn = Connection::new(busid.clone());
     let mut runner = RealRunner;
+    // Tracks the firewall rule lifetime; populated on Action::Bind, dropped
+    // on Action::Unbind or when the daemon exits.
+    let mut peer_lock: Option<PeerLock> = None;
 
     let term = Arc::new(AtomicBool::new(false));
     for sig in [
@@ -120,6 +125,7 @@ pub fn run(args: Args) {
         let effective_peer_present = beacon_present && !paused;
         if let Some(action) = conn.tick(effective_peer_present, &mut runner) {
             eprintln!("connection: {action:?} (state={:?})", conn.state());
+            apply_firewall(action, &beacon, &mut peer_lock);
         }
         let status = control::Status {
             peer_name: Some(trusted.name.clone()),
@@ -135,7 +141,37 @@ pub fn run(args: Args) {
 
     eprintln!("shutdown signal — unbinding");
     let _ = conn.tick(false, &mut runner);
+    drop(peer_lock);
     let _ = control::clear_status(&args.control_dir);
+}
+
+fn current_peer_ipv4(beacon: &discovery::Beacon) -> Option<std::net::Ipv4Addr> {
+    match beacon.current_peer()? {
+        std::net::SocketAddr::V4(v4) => Some(*v4.ip()),
+        std::net::SocketAddr::V6(_) => None,
+    }
+}
+
+fn apply_firewall(
+    action: Action,
+    beacon: &discovery::Beacon,
+    peer_lock: &mut Option<PeerLock>,
+) {
+    match action {
+        Action::Bind => {
+            if let Some(peer_ip) = current_peer_ipv4(beacon) {
+                match PeerLock::install(peer_ip) {
+                    Ok(lock) => *peer_lock = lock,
+                    Err(e) => eprintln!("firewall: {e}"),
+                }
+            } else {
+                eprintln!("firewall: no IPv4 peer at bind time; skipping peer-lock");
+            }
+        }
+        Action::Unbind => {
+            *peer_lock = None;
+        }
+    }
 }
 
 pub fn run_pair(state_dir: &std::path::Path) {
