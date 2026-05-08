@@ -39,6 +39,8 @@ use deck_protocol::{AuthKey, Buttons, ControllerState};
 #[cfg(windows)]
 mod attach;
 #[cfg(windows)]
+mod autostart;
+#[cfg(windows)]
 mod driver;
 #[cfg(windows)]
 mod tray;
