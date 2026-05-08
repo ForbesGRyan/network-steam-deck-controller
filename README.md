@@ -60,6 +60,33 @@ Per-binary platform support:
 | `kiosk-deck` (`network-deck-kiosk`) | Linux (eframe/egui, X11 or Wayland) | builds, exits with "Linux only" |
 | `client-win` | Windows (shells out to `usbip.exe`, Win32 tray) | builds, no-ops tray calls |
 
+### cargo-make shortcuts
+
+A `Makefile.toml` is included for the common build/install/pair workflows.
+One-time setup:
+
+```sh
+cargo install cargo-make
+```
+
+Then on each platform:
+
+| Task | What it does |
+|---|---|
+| `cargo make build-all` | Release build of every member (cross-platform safe). |
+| `cargo make build-deck` | Release build of `server-deck` + `kiosk-deck` (Linux only). |
+| `cargo make build-win` | Release build of `client-win` (Windows only). |
+| `cargo make install-deck` | Build Deck bins + `sudo bash scripts/install-deck.sh`. |
+| `cargo make install-win` | Build `client-win` + run `scripts/install-windows.ps1` (admin). |
+| `cargo make pair-deck` / `pair-win` | One-shot pair flow on the corresponding side. |
+| `cargo make verify` | `test` + `clippy` + `fmt --check`. |
+| `cargo make deck-service-restart` | `sudo systemctl restart network-deck-server.service`. |
+| `cargo make deck-status` | Tail the daemon's journalctl log. |
+
+Each task refuses to run on the wrong OS, so `cargo make build-deck` on
+Windows fails fast with a "platform not supported" message instead of
+attempting a meaningless build.
+
 ## Install
 
 ### On the Deck (SteamOS)
