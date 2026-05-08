@@ -1,19 +1,15 @@
-# network-steam-deck-controller
+# network-usb
 
-Wireless bridge that streams Steam Deck controller inputs over Wi-Fi to a
-Windows PC, where they appear as a virtual Steam Deck controller. Steam Input
-on Windows handles all gameplay-side mapping (gyro, trackpads, back paddles,
-per-game profiles).
+Wireless gamepad bridge: Steam Deck controls → Windows PC. Built on stock
+USB/IP — `usbip-host` on the Deck, `usbip-win2` on Windows. This repo
+provides the discovery + lifecycle glue that makes the two ends find each
+other and stay attached.
 
-> **Status:** working scaffold. Rust crates compile and pass 30 unit
-> tests. The Deck → hidraw → wire pipeline has been validated on real
-> hardware. The Windows kernel driver enumerates as a real Steam Deck
-> Controller, Steam Input loads its `controller_neptune` config, and live
-> HID frames + rumble flow through. End-to-end network validation is
-> still gated on a Hyper-V external-vSwitch UDP-drop issue we have not
-> yet bypassed (USB ethernet adapter or bare-metal pivot). See
-> [ARCHITECTURE.md](ARCHITECTURE.md) for the full design and remaining
-> validations.
+> **Status:** complete pivot. `discovery` crate, `server-deck`, and
+> `client-win` are all rewritten around the usbip backend. Hardware-tested:
+> `usbipd` + `usbip-win2 v0.9.7.7` produces a Deck that Steam recognizes
+> and works in-game with no custom driver required. See
+> [ARCHITECTURE.md](ARCHITECTURE.md) for design detail.
 
 ## Why
 
@@ -21,27 +17,27 @@ You have a Steam Deck and a Windows gaming PC. You want to use the Deck as a
 wireless controller — including its gyro, trackpads, and back paddles —
 without plugging anything in. This project does that by:
 
-1. Reading the Deck's internal controller via `/dev/hidraw` on the Deck.
-2. Shipping canonical state over UDP to your PC.
-3. A small Windows kernel driver presents a virtual Steam Deck controller
-   to the OS.
+1. Running `usbipd` on the Deck and binding the internal controller's USB device.
+2. Shipping the USB bus over TCP to your PC via `usbip-win2`.
+3. Windows sees a real Steam Deck controller on a virtual USB host.
 4. Steam Input recognizes it natively — every Steam game that already
    supports the Deck just works.
 
-Why not VirtualHere / USB-over-IP / ViGEmBus / Steam Link?
-[ARCHITECTURE.md](ARCHITECTURE.md#why-this-design-decision-history) walks
-through each alternative and why this design was chosen.
+Why not VirtualHere / ViGEmBus / Steam Link?
+[ARCHITECTURE.md](ARCHITECTURE.md#why-this-design) walks through each
+alternative and why this design was chosen.
 
 ## Layout
 
 ```
 crates/
-  deck-protocol/    types + HID codec + wire codec (no I/O, no_std-friendly)
-  server-deck/      Linux binary: hidraw -> wire -> UDP
-  client-win/       Windows binary: UDP -> wire -> HID -> driver IOCTL
-driver/             KMDF + UdeCx kernel driver (C++) + INF
-tools/              fetch-on-demand reference materials
-ARCHITECTURE.md     design history, build sequence, pending validations
+  discovery/      Ed25519 identity, signed-UDP beacon, trust file, pair flow
+  server-deck/    Linux binary: sysfs busid lookup + usbip bind state machine
+  client-win/     Windows binary: tray app + usbip.exe attach state machine
+scripts/
+  install-deck.sh          Deck-side installer (pacman + systemd)
+  install-windows.ps1      Windows-side installer (usbip-win2 + binary drop)
+ARCHITECTURE.md   design history, component diagram, open risks
 ```
 
 ## Build
@@ -57,163 +53,66 @@ Per-binary platform support:
 
 | Binary | Real platform | Other platforms |
 |---|---|---|
-| `server-deck` | Linux (uses `/dev/hidraw*`) | builds, exits with "Linux only" |
-| `client-win` | Windows (uses Win32 + driver IOCTL) | builds, runs in listen-only mode |
+| `server-deck` | Linux (shells out to `usbip`) | builds, exits with "Linux only" |
+| `client-win` | Windows (shells out to `usbip.exe`, Win32 tray) | builds, no-ops tray calls |
 
-The kernel driver is **not** in the Cargo workspace. It needs Visual Studio
-+ the Windows Driver Kit; see [driver/README.md](driver/README.md) for
-setup.
+## Install
 
-## Run
+### On the Deck (SteamOS)
 
-### Build
-
-```sh
-cargo build --workspace --release
-cargo test --workspace
+```
+sudo ./scripts/install-deck.sh
 ```
 
-### Windows side (PC running games)
+This installs `usbip` from pacman, enables `usbipd.service`, drops
+`server-deck` into `/usr/local/bin`, and installs the systemd unit.
 
-1. **Build and install the kernel driver.** The driver is *not* part of
-   the Cargo workspace; it needs Visual Studio + the WDK. See
-   [driver/README.md](driver/README.md). After building:
+### On Windows
 
-   ```powershell
-   # Elevated PowerShell.
-   bcdedit /set testsigning on   # one-time, until you have an EV cert
-   # Reboot, then:
-   pwsh -ExecutionPolicy Bypass -File driver\scripts\install.ps1
-   ```
+From an elevated PowerShell:
 
-   `install.ps1` wraps `pnputil /add-driver` plus the
-   `devcon install root\NetworkDeckController` call needed to instantiate
-   the root-enumerated PnP node. Uninstall via `driver\scripts\uninstall.ps1`.
-
-2. **First-time pairing** (one-time): while `server-deck pair /dev/hidrawN`
-   is running on the Deck, run:
-
-   ```powershell
-   .\target\release\client-win.exe pair
-   ```
-
-   Both sides print a short fingerprint. Confirm they match visibly on
-   both screens, then type `y` on each side. The trusted-peer state is
-   saved to `%LOCALAPPDATA%\network-deck\` automatically.
-
-3. **Normal run:**
-
-   ```powershell
-   .\target\release\client-win.exe
-   ```
-
-   The service binds UDP 49152, beacons on the LAN, and starts forwarding
-   packets the moment the Deck side replies.
-
-   Useful test modes:
-   - `client-win.exe --test` synthesizes alternating-A-button reports at
-     ~250 Hz so Steam's Controller Layout test screen can verify the
-     virtual device works without a Deck attached.
-   - `client-win.exe --replay <hidraw-capture.bin>` replays a captured
-     hidraw stream from a real Deck (`cat /dev/hidrawN > foo.bin` on the
-     Deck) at full cadence.
-
-### Deck side (Linux)
-
-1. **One-time: udev rule** so the deck user can read hidraw without sudo:
-
-   ```sh
-   sudo cp crates/server-deck/scripts/70-steam-deck.rules /etc/udev/rules.d/
-   sudo udevadm control --reload && sudo udevadm trigger
-   ```
-
-2. **First-time pairing** (one-time): while `client-win.exe pair` is
-   running on the PC, run:
-
-   ```sh
-   ./target/release/server-deck pair /dev/hidrawN
-   ```
-
-   Confirm the printed fingerprints match on both screens, then accept on
-   each side. Trusted-peer state is saved automatically.
-
-3. **Normal run:**
-
-   ```sh
-   ./target/release/server-deck /dev/hidrawN
-   ```
-
-4. **systemd:** install the unit the same way as before:
-
-   ```sh
-   sudo cp crates/server-deck/scripts/network-deck-server.service /etc/systemd/system/
-   sudo systemctl daemon-reload
-   sudo systemctl enable --now network-deck-server.service
-   ```
-
-   The unit uses `--state-dir /var/lib/network-deck`. Pair once manually
-   (steps 1–2 above) before enabling the service, or stop the service,
-   run `sudo -u deck server-deck pair /dev/hidraw3 --state-dir /var/lib/network-deck`
-   (`/var/lib/network-deck` is owned by the `deck` user via `StateDirectory=`),
-   then re-enable.
-
-### What you'll see
-
-Both binaries print live stats. Steam's Controller Layout test screen
-mirrors button presses and stick / trackpad state with single-frame
-latency over a clean Wi-Fi link.
-
-To find the right hidraw node on the Deck:
-```sh
-for f in /sys/class/hidraw/hidraw*/device/uevent; do
-    grep -l "HID_ID=0003:000028DE:00001205" "$f" \
-        && echo "  -> ${f%/device/uevent}"
-done
+```
+.\scripts\install-windows.ps1
 ```
 
-While Steam owns the controller in `hid-steam` mode, hidraw won't see
-gamepad-state frames. To get raw frames, kill Steam and unbind hid-steam:
-```sh
-echo -n "<phys-id>" | sudo tee /sys/bus/hid/drivers/hid-steam/unbind
+Installs usbip-win2 (signed driver, accept the Windows driver dialog),
+drops `client-win.exe` into `%LOCALAPPDATA%\NetworkDeck`, and the tray
+self-registers for autostart on first run.
+
+### Pair
+
+One-shot. Run on each side at the same time:
+
+```
+sudo /usr/local/bin/server-deck pair --state-dir /var/lib/network-deck   # Deck
+& "$env:LOCALAPPDATA\NetworkDeck\client-win.exe" pair                    # Windows
 ```
 
-**Troubleshooting:** If the status line stays at `peer: searching` after
-both sides are running, broadcasts may be filtered (guest VLAN, AP
+Confirm matching fingerprints on both prompts within 120 s. After pair,
+enable the Deck service:
+
+```
+sudo systemctl enable --now network-deck-server.service
+```
+
+The Windows tray will pick up the Deck's beacon and auto-attach.
+
+## Troubleshooting
+
+**Tray stays "Searching":** broadcasts may be filtered (guest VLAN, AP
 isolation). Try a wired connection or join both devices to the same SSID
 without isolation.
 
-## What's left
+**Controller drops mid-game:** a Wi-Fi blip causes a visible USB unplug
+under TCP transport. Some games recover; some require a restart. Keep
+the bridge on 5 GHz. The attach state machine retries automatically so
+the next game session will pick up without manual intervention.
 
-Tracked in detail in [ARCHITECTURE.md](ARCHITECTURE.md#build-sequence):
-
-1. Lift Deck HID layout into `deck-protocol`. — done
-2. Hidraw spike: validate `BUTTON_MAP` against real hardware. — done
-3. Static UDE driver: descriptors, plug-in flow, "Steam Deck Controls"
-   appears in Steam. — done (Hyper-V VM with test signing)
-4. Feature-report path: lizard-mode disable, haptics-config ack. — done
-   (Steam recognizes as Deck, `controller_neptune` config loads)
-5. User-mode IPC + live HID frames over IOCTL. — done
-   (`client-win --test` toggles the A button visible in Steam at 1 Hz)
-6. Real Deck bytes → driver → Steam (protocol). — done
-   (replayed 1249 captured frames via `client-win --replay`, button
-   transitions show in Steam Controller Layout)
-7. Output channel: rumble/haptics back to Deck. — done (path wired;
-   end-to-end validation pending network and a Deck running `server-deck`)
-8. Polish: reconnect, pairing, packaging. — done
-   (driver/hidraw reopen on transient failure, optional HMAC-SHA256
-   per-packet auth + 30 s replay window via `NETWORK_DECK_KEY`,
-   PowerShell install scripts, systemd unit + udev rule)
-9. LAN discovery + first-time pairing — done.
-   (`pair` subcommand on each binary runs a 120 s mutual-confirm flow;
-   long-lived Ed25519 identities; HKDF-derived session key replaces the
-   removed `NETWORK_DECK_KEY` env var.)
+**vhci not available after suspend:** run `.\scripts\install-windows.ps1`
+again (idempotent) or restart the usbip-win2 service; the tray's attach
+state machine will reconnect once the driver is ready.
 
 ## License
 
 The Rust workspace is dual-licensed under MIT OR Apache-2.0 (see the
-`license` field in `Cargo.toml`). The driver will follow the same once
-its bodies are written.
-
-Reference materials under `tools/reference/` (Linux kernel sources used to
-derive the HID codec) are GPL-2.0+ and intentionally not committed —
-fetch them on demand per [tools/README.md](tools/README.md).
+`license` field in `Cargo.toml`).
