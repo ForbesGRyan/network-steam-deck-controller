@@ -13,7 +13,19 @@ use crate::packet::{
     self, fingerprint, BeaconPacket, FPR_LEN, PACKET_LEN,
 };
 use crate::trust::TrustedPeer;
-use deck_protocol::auth::REPLAY_WINDOW_US;
+
+/// ±wall-clock skew tolerated for beacon packets, in microseconds.
+/// 30 s is short enough to defang a delayed replay, long enough to absorb
+/// NTP wobble between two LAN hosts that haven't slewed in a while.
+const REPLAY_WINDOW_US: u32 = 30_000_000;
+
+/// True if `packet_us` is within `window_us` of `now_us` (wrap-aware).
+/// Both timestamps are the low 32 bits of microseconds since some epoch.
+#[allow(clippy::cast_possible_wrap)]
+fn is_within_replay_window(packet_us: u32, now_us: u32, window_us: u32) -> bool {
+    let dt = (now_us as i32).wrapping_sub(packet_us as i32);
+    dt.unsigned_abs() <= window_us
+}
 
 pub const BEACON_INTERVAL: Duration = Duration::from_secs(1);
 pub const STALE_AFTER: Duration = Duration::from_secs(5);
@@ -105,7 +117,7 @@ impl Beacon {
         let now32 = now_us() as u32;
         #[allow(clippy::cast_possible_truncation)]
         let pkt32 = decoded.timestamp_us as u32;
-        if !deck_protocol::auth::is_within_replay_window(pkt32, now32, REPLAY_WINDOW_US) { return; }
+        if !is_within_replay_window(pkt32, now32, REPLAY_WINDOW_US) { return; }
         // Normalize src to the data-plane listen port (fix #1: port mismatch).
         // The sender's beacon comes from an ephemeral send socket; the actual
         // data-plane port we must reach is self.listen_port.
