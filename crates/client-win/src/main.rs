@@ -5,7 +5,7 @@
 //! network blips. Tray menu lets the user override.
 
 use std::net::{Ipv4Addr, SocketAddr, UdpSocket};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::thread::JoinHandle;
@@ -188,7 +188,7 @@ fn run_normal(identity: &Arc<discovery::Identity>, state_dir: &std::path::Path) 
     );
 
     #[cfg(windows)]
-    run_attach_loop(&beacon, recv, identity.clone(), state_dir.to_path_buf());
+    run_attach_loop(&beacon, recv, identity, state_dir);
 
     #[cfg(not(windows))]
     let _ = recv;
@@ -203,13 +203,37 @@ fn run_normal(identity: &Arc<discovery::Identity>, state_dir: &std::path::Path) 
 }
 
 #[cfg(windows)]
+struct CliDriver {
+    cli: crate::usbip_cli::UsbipCli,
+}
+
+#[cfg(windows)]
+impl crate::attach::UsbipDriver for CliDriver {
+    fn discover_busid(&mut self, host: &str) -> Option<String> {
+        self.cli
+            .list_remote(host)
+            .ok()?
+            .into_iter()
+            .find(|d| d.vid == "28de" && d.pid == "1205")
+            .map(|d| d.busid)
+    }
+    fn attach(&mut self, host: &str, busid: &str) -> bool {
+        self.cli.attach(host, busid).is_ok()
+    }
+    fn ported_busids(&mut self) -> Vec<String> {
+        self.cli.port().unwrap_or_default()
+    }
+}
+
+#[cfg(windows)]
+#[allow(clippy::too_many_lines)]
 fn run_attach_loop(
     beacon: &Arc<discovery::Beacon>,
     mut recv: RecvThread,
-    identity: Arc<discovery::Identity>,
-    state_dir: PathBuf,
+    identity: &Arc<discovery::Identity>,
+    state_dir: &Path,
 ) {
-    use crate::attach::{Attach, State, UsbipDriver};
+    use crate::attach::{Attach, State};
     use crate::tray::TrayEvent;
     use crate::usbip_cli::{CliError, UsbipCli};
 
@@ -225,25 +249,6 @@ fn run_attach_loop(
         }
     };
 
-    struct CliDriver {
-        cli: UsbipCli,
-    }
-    impl UsbipDriver for CliDriver {
-        fn discover_busid(&mut self, host: &str) -> Option<String> {
-            self.cli
-                .list_remote(host)
-                .ok()?
-                .into_iter()
-                .find(|d| d.vid == "28de" && d.pid == "1205")
-                .map(|d| d.busid)
-        }
-        fn attach(&mut self, host: &str, busid: &str) -> bool {
-            self.cli.attach(host, busid).is_ok()
-        }
-        fn ported_busids(&mut self) -> Vec<String> {
-            self.cli.port().unwrap_or_default()
-        }
-    }
     let mut driver = CliDriver { cli };
 
     let (tray_rx, tray_handle) = tray::spawn();
@@ -271,9 +276,9 @@ fn run_attach_loop(
                     let sock = recv.stop();
                     let outcome = pair_dialog::run(
                         sock,
-                        identity.clone(),
+                        Arc::clone(identity),
                         hostname(),
-                        &state_dir,
+                        state_dir,
                     );
                     match outcome {
                         discovery::pair::PairOutcome::Paired(_) => {
@@ -283,6 +288,11 @@ fn run_attach_loop(
                             if let Ok(exe) = std::env::current_exe() {
                                 let _ = std::process::Command::new(exe).spawn();
                             }
+                            // process::exit skips destructors. The pair flow
+                            // already consumed the recv socket, but the tray
+                            // handle is still live — drop it so the new exe
+                            // doesn't race us on tray-icon HWND cleanup.
+                            drop(tray_handle);
                             std::process::exit(0);
                         }
                         other => {

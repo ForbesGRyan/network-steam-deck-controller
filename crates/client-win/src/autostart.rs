@@ -2,8 +2,6 @@
 //!
 //! User-scope registry write — no admin needed.
 
-#![cfg(windows)]
-
 use std::ffi::OsStr;
 use std::os::windows::ffi::OsStrExt;
 
@@ -33,14 +31,14 @@ pub fn enable() -> Result<(), u32> {
 /// Remove our autostart entry. No-op if absent.
 ///
 /// # Errors
-/// Returns the Win32 error code on failure (ERROR_FILE_NOT_FOUND is treated as success).
+/// Returns the Win32 error code on failure (`ERROR_FILE_NOT_FOUND` is treated as success).
 #[allow(dead_code)] // public API; tray "disable autostart" toggle not wired yet
 pub fn disable() -> Result<(), u32> {
     let subkey = wide(SUBKEY);
     let value = wide(VALUE_NAME);
     let mut key: HKEY = std::ptr::null_mut();
     unsafe {
-        let r = RegOpenKeyExW(HKEY_CURRENT_USER, subkey.as_ptr(), 0, KEY_WRITE, &mut key);
+        let r = RegOpenKeyExW(HKEY_CURRENT_USER, subkey.as_ptr(), 0, KEY_WRITE, &raw mut key);
         if r == 2 {
             // Run key absent — nothing to disable.
             return Ok(());
@@ -65,7 +63,7 @@ pub fn current() -> Option<String> {
     let value = wide(VALUE_NAME);
     let mut key: HKEY = std::ptr::null_mut();
     unsafe {
-        if RegOpenKeyExW(HKEY_CURRENT_USER, subkey.as_ptr(), 0, KEY_READ, &mut key)
+        if RegOpenKeyExW(HKEY_CURRENT_USER, subkey.as_ptr(), 0, KEY_READ, &raw mut key)
             != ERROR_SUCCESS
         {
             return None;
@@ -77,20 +75,23 @@ pub fn current() -> Option<String> {
             std::ptr::null(),
             std::ptr::null_mut(),
             std::ptr::null_mut(),
-            &mut size,
+            &raw mut size,
         );
         if r != ERROR_SUCCESS {
             let _ = RegCloseKey(key);
             return None;
         }
-        let mut buf = vec![0_u16; (size as usize) / 2];
+        // Round up: a malformed REG_SZ with odd byte count would otherwise
+        // under-allocate by one element and let the second RegQueryValueExW
+        // write past the buffer.
+        let mut buf = vec![0_u16; size.div_ceil(2) as usize];
         let r = RegQueryValueExW(
             key,
             value.as_ptr(),
             std::ptr::null(),
             std::ptr::null_mut(),
             buf.as_mut_ptr().cast(),
-            &mut size,
+            &raw mut size,
         );
         let _ = RegCloseKey(key);
         if r != ERROR_SUCCESS {
@@ -110,7 +111,7 @@ fn write_run_value(exe: &str) -> Result<(), u32> {
     let exe_w = wide(exe);
     let mut key: HKEY = std::ptr::null_mut();
     unsafe {
-        let r = RegOpenKeyExW(HKEY_CURRENT_USER, subkey.as_ptr(), 0, KEY_WRITE, &mut key);
+        let r = RegOpenKeyExW(HKEY_CURRENT_USER, subkey.as_ptr(), 0, KEY_WRITE, &raw mut key);
         if r != ERROR_SUCCESS {
             return Err(r);
         }
