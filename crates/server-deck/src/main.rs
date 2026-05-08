@@ -37,6 +37,8 @@
 //! not automate that — the goal is to validate the protocol crate against
 //! real bytes, not to manage device ownership.
 
+mod sysfs;
+
 #[cfg(not(target_os = "linux"))]
 fn main() {
     eprintln!(
@@ -53,6 +55,7 @@ fn main() {
 
 #[cfg(target_os = "linux")]
 mod linux {
+    use super::sysfs;
     use std::fs::{File, OpenOptions};
     use std::io::{Read, Write};
     use std::net::{Ipv4Addr, SocketAddr, UdpSocket};
