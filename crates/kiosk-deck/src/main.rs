@@ -21,8 +21,6 @@ fn main() {
 
 #[cfg(target_os = "linux")]
 fn main() -> eframe::Result {
-    use eframe::egui;
-
     let options = eframe::NativeOptions::default();
     eframe::run_native(
         "Network Deck",
