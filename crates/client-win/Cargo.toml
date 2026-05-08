@@ -6,6 +6,7 @@ license.workspace = true
 description = "Windows side: receive controller state from Deck, hand HID reports to UDE driver"
 
 [dependencies]
+crossbeam-channel = "0.5"
 deck-protocol = { path = "../deck-protocol" }
 discovery = { path = "../discovery" }
 which = "7"
@@ -17,6 +18,7 @@ windows-sys = { version = "0.59", features = [
     "Win32_System_IO",
     "Win32_Devices_DeviceAndDriverInstallation",
     "Win32_Security",
+    "Win32_UI_WindowsAndMessaging",
 ] }
 tray-icon = "0.20"
 

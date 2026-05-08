@@ -41,6 +41,8 @@ mod attach;
 #[cfg(windows)]
 mod driver;
 #[cfg(windows)]
+mod tray;
+#[cfg(windows)]
 mod usbip_cli;
 
 const DEFAULT_PORT: u16 = 49152;
