@@ -146,10 +146,14 @@ mod tests {
 
     #[test]
     fn peer_bound_renders_connected_targeting_pause() {
-        let s = status(Some("desktop"), true, true, false);
-        let v = derive_view(Some(&s));
+        let with_name = status(Some("desktop"), true, true, false);
+        let v = derive_view(Some(&with_name));
         assert_eq!(v.text, "Connected to desktop");
         assert_eq!(v.button_label, "Disconnect");
         assert_eq!(v.toggle_to, Some(true));
+
+        let without_name = status(None, true, true, false);
+        let v = derive_view(Some(&without_name));
+        assert_eq!(v.text, "Connected to client");
     }
 }
