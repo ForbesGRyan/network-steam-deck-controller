@@ -60,10 +60,7 @@ mod tests {
 
     #[test]
     fn directed_broadcast_32_returns_none() {
-        let bcast = directed_broadcast(
-            Ipv4Addr::new(1, 2, 3, 4),
-            Ipv4Addr::new(255, 255, 255, 255),
-        );
+        let bcast = directed_broadcast(Ipv4Addr::new(1, 2, 3, 4), Ipv4Addr::BROADCAST);
         assert_eq!(bcast, None);
     }
 

@@ -36,7 +36,7 @@ pub struct Attach {
     /// from the port list (= remote dropped us).
     attached_busid: Option<String>,
     /// Min delay between attach attempts. Backoff doubles on failure up to
-    /// max_backoff; resets on success.
+    /// `max_backoff`; resets on success.
     backoff: Duration,
     max_backoff: Duration,
     base_backoff: Duration,
@@ -80,7 +80,7 @@ impl Attach {
                 if !peer_present {
                     return None;
                 }
-                let Some(host) = peer_host else { return None };
+                let host = peer_host?;
                 if let Some(last) = self.last_attempt {
                     if now.duration_since(last) < self.backoff {
                         return None;

@@ -13,8 +13,6 @@
 //! the tray thread via a second crossbeam channel, keeping the `TrayIcon`
 //! entirely on its own thread.
 
-#![cfg(windows)]
-
 use crossbeam_channel::{unbounded, Receiver, Sender};
 use tray_icon::menu::{Menu, MenuEvent, MenuItem};
 use tray_icon::{Icon, TrayIconBuilder};
@@ -56,14 +54,14 @@ pub fn spawn() -> (Receiver<TrayEvent>, TrayHandle) {
     std::thread::Builder::new()
         .name("tray".into())
         .spawn(move || {
-            run_tray_thread(tx, tooltip_rx);
+            run_tray_thread(&tx, &tooltip_rx);
         })
         .ok();
 
     (rx, TrayHandle { tooltip_tx })
 }
 
-fn run_tray_thread(tx: Sender<TrayEvent>, tooltip_rx: Receiver<String>) {
+fn run_tray_thread(tx: &Sender<TrayEvent>, tooltip_rx: &Receiver<String>) {
     let menu = Menu::new();
     let connect = MenuItem::new("Connect", true, None);
     let disconnect = MenuItem::new("Disconnect", true, None);
@@ -104,23 +102,23 @@ fn run_tray_thread(tx: Sender<TrayEvent>, tooltip_rx: Receiver<String>) {
         tx,
         tooltip_rx,
         &tray_icon,
-        connect_id,
-        disconnect_id,
-        pair_id,
-        quit_id,
+        &connect_id,
+        &disconnect_id,
+        &pair_id,
+        &quit_id,
     );
 }
 
 #[allow(clippy::too_many_arguments)]
 fn pump_messages(
     menu_rx: &crossbeam_channel::Receiver<MenuEvent>,
-    tx: Sender<TrayEvent>,
-    tooltip_rx: Receiver<String>,
+    tx: &Sender<TrayEvent>,
+    tooltip_rx: &Receiver<String>,
     tray_icon: &tray_icon::TrayIcon,
-    connect_id: tray_icon::menu::MenuId,
-    disconnect_id: tray_icon::menu::MenuId,
-    pair_id: tray_icon::menu::MenuId,
-    quit_id: tray_icon::menu::MenuId,
+    connect_id: &tray_icon::menu::MenuId,
+    disconnect_id: &tray_icon::menu::MenuId,
+    pair_id: &tray_icon::menu::MenuId,
+    quit_id: &tray_icon::menu::MenuId,
 ) {
     use windows_sys::Win32::UI::WindowsAndMessaging::{
         DispatchMessageW, PeekMessageW, TranslateMessage, MSG, PM_REMOVE,
@@ -143,13 +141,13 @@ fn pump_messages(
 
         // Drain menu events.
         while let Ok(event) = menu_rx.try_recv() {
-            let mapped = if event.id == connect_id {
+            let mapped = if event.id == *connect_id {
                 Some(TrayEvent::Connect)
-            } else if event.id == disconnect_id {
+            } else if event.id == *disconnect_id {
                 Some(TrayEvent::Disconnect)
-            } else if event.id == pair_id {
+            } else if event.id == *pair_id {
                 Some(TrayEvent::Pair)
-            } else if event.id == quit_id {
+            } else if event.id == *quit_id {
                 Some(TrayEvent::Quit)
             } else {
                 None
@@ -165,9 +163,9 @@ fn pump_messages(
         // Pump one Win32 message (non-blocking) so the tray icon stays
         // responsive. A short sleep keeps the loop from spinning at 100%.
         unsafe {
-            if PeekMessageW(&mut msg, std::ptr::null_mut(), 0, 0, PM_REMOVE) != 0 {
-                let _ = TranslateMessage(&msg);
-                DispatchMessageW(&msg);
+            if PeekMessageW(&raw mut msg, std::ptr::null_mut(), 0, 0, PM_REMOVE) != 0 {
+                let _ = TranslateMessage(&raw const msg);
+                DispatchMessageW(&raw const msg);
             }
         }
         std::thread::sleep(std::time::Duration::from_millis(50));

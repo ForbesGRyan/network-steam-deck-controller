@@ -8,8 +8,6 @@
 //! dependency. On success the caller re-execs the tray so the new trust
 //! file is picked up cleanly.
 
-#![cfg(windows)]
-
 use std::net::UdpSocket;
 use std::path::Path;
 use std::sync::Arc;
