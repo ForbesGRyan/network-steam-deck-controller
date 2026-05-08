@@ -17,12 +17,13 @@ use crate::trust::TrustedPeer;
 /// ±wall-clock skew tolerated for beacon packets, in microseconds.
 /// 30 s is short enough to defang a delayed replay, long enough to absorb
 /// NTP wobble between two LAN hosts that haven't slewed in a while.
-const REPLAY_WINDOW_US: u32 = 30_000_000;
+pub const REPLAY_WINDOW_US: u32 = 30_000_000;
 
 /// True if `packet_us` is within `window_us` of `now_us` (wrap-aware).
 /// Both timestamps are the low 32 bits of microseconds since some epoch.
 #[allow(clippy::cast_possible_wrap)]
-fn is_within_replay_window(packet_us: u32, now_us: u32, window_us: u32) -> bool {
+#[must_use]
+pub fn is_within_replay_window(packet_us: u32, now_us: u32, window_us: u32) -> bool {
     let dt = (now_us as i32).wrapping_sub(packet_us as i32);
     dt.unsigned_abs() <= window_us
 }

@@ -19,12 +19,27 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use crate::beacon::{is_within_replay_window, REPLAY_WINDOW_US};
 use crate::identity::Identity;
 use crate::packet::{
-    self, fingerprint, fingerprint_str, BeaconPacket, FLAG_ACCEPT, FLAG_PAIRING, FPR_LEN,
-    PACKET_LEN,
+    self, fingerprint, fingerprint_str, BeaconPacket, PUBKEY_LEN, FLAG_ACCEPT, FLAG_PAIRING,
+    FPR_LEN, PACKET_LEN,
 };
 use crate::trust::{save as save_trust, TrustedPeer};
+
+/// Window over which we collect distinct PAIRING beacons before showing the
+/// user a chooser. Prevents an attacker who simply broadcasts first from
+/// pre-empting the legitimate peer in the prompt.
+const CANDIDATE_COLLECT_WINDOW: Duration = Duration::from_millis(1500);
+
+/// A peer observed broadcasting a `FLAG_PAIRING` beacon during the
+/// collection window. `pubkey` is sender-controlled but signature-verified;
+/// `name` is sender-controlled and untrusted display text.
+#[derive(Clone, Debug)]
+pub struct PairCandidate {
+    pub pubkey: [u8; PUBKEY_LEN],
+    pub name: String,
+}
 
 pub struct PairConfig {
     pub identity: Arc<Identity>,
@@ -61,9 +76,23 @@ pub trait PairUI {
     /// User saw a candidate peer. Return `Accept` to proceed to the
     /// confirmation phase; `Reject` to keep listening for others.
     fn prompt_peer(&mut self, name: &str, fingerprint: &str) -> Decision;
+    /// Pick one peer from a batch of candidates collected during the
+    /// pre-prompt window. Returns `None` to permanently decline every
+    /// peer in the batch and keep listening. Default impl falls through
+    /// to `prompt_peer` per-candidate so existing UIs keep working.
+    fn prompt_candidates(&mut self, candidates: &[PairCandidate]) -> Option<PairCandidate> {
+        for c in candidates {
+            let fpr = fingerprint_str(&fingerprint(&c.pubkey));
+            if matches!(self.prompt_peer(&c.name, &fpr), Decision::Accept) {
+                return Some(c.clone());
+            }
+        }
+        None
+    }
     fn on_paired(&mut self, _peer: &TrustedPeer) {}
     fn on_failed(&mut self, _reason: &str) {}
 }
+
 
 const TICK: Duration = Duration::from_millis(200);
 
@@ -77,6 +106,17 @@ const TICK: Duration = Duration::from_millis(200);
 /// only one side ever reached its prompt — the deadlock the user reported
 /// on 2026-05-08.
 pub fn run_pair_with<U: PairUI>(cfg: &PairConfig, ui: &mut U) -> PairOutcome {
+    run_pair_with_candidates(cfg, ui)
+}
+
+/// Pair flow that buffers every distinct PAIRING peer seen during a short
+/// window and lets the UI's `prompt_candidates` pick one — defending
+/// against an attacker who races the legitimate peer's first beacon.
+///
+/// Equivalent to `run_pair_with` for UIs that don't override
+/// `prompt_candidates`, since the default impl walks the batch with
+/// `prompt_peer` in arrival order.
+pub fn run_pair_with_candidates<U: PairUI>(cfg: &PairConfig, ui: &mut U) -> PairOutcome {
     cfg.recv_sock.set_read_timeout(Some(TICK)).ok();
     ui.on_started(
         &fingerprint_str(&fingerprint(&cfg.identity.pubkey)),
@@ -106,31 +146,25 @@ pub fn run_pair_with<U: PairUI>(cfg: &PairConfig, ui: &mut U) -> PairOutcome {
 
     let deadline = Instant::now() + cfg.timeout;
     let mut buf = [0_u8; PACKET_LEN];
-    let mut declined: HashSet<[u8; crate::packet::PUBKEY_LEN]> = HashSet::new();
+    let mut declined: HashSet<[u8; PUBKEY_LEN]> = HashSet::new();
 
-    // Phase 1+2: discover and prompt. (Sender thread keeps blasting
-    // `FLAG_PAIRING` whether or not we're parked at the prompt.)
+    // Phase 1+2: collect distinct PAIRING peers for a short window, then
+    // ask the caller to pick one. Repeat if they decline the whole batch.
     let candidate = loop {
-        if Instant::now() >= deadline {
-            ui.on_failed("timeout waiting for peer");
-            return PairOutcome::Timeout;
-        }
-        match cfg.recv_sock.recv_from(&mut buf) {
-            Ok((n, _src)) if n == PACKET_LEN => {
-                if let Ok(p) = packet::verify(&buf) {
-                    if (p.flags & FLAG_PAIRING) != 0 && p.pubkey != cfg.identity.pubkey {
-                        if declined.contains(&p.pubkey) { continue; }
-                        let fpr_str = fingerprint_str(&fingerprint(&p.pubkey));
-                        match ui.prompt_peer(&p.name, &fpr_str) {
-                            Decision::Accept => break p,
-                            Decision::Reject => { declined.insert(p.pubkey); }
-                        }
+        match collect_candidates(cfg, &mut buf, &declined, deadline) {
+            CollectOutcome::Candidates(found) => match ui.prompt_candidates(&found) {
+                Some(c) => break c,
+                None => {
+                    for c in found {
+                        declined.insert(c.pubkey);
                     }
                 }
+            },
+            CollectOutcome::Timeout => {
+                ui.on_failed("timeout waiting for peer");
+                return PairOutcome::Timeout;
             }
-            Ok(_) => {}
-            Err(e) if matches!(e.kind(), io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut) => {}
-            Err(e) => {
+            CollectOutcome::IoError(e) => {
                 ui.on_failed(&format!("recv error: {e}"));
                 return PairOutcome::IoError(e);
             }
@@ -151,26 +185,29 @@ pub fn run_pair_with<U: PairUI>(cfg: &PairConfig, ui: &mut U) -> PairOutcome {
             return PairOutcome::Timeout;
         }
         match cfg.recv_sock.recv_from(&mut buf) {
-            Ok((n, _src)) if n == PACKET_LEN => {
-                if let Ok(p) = packet::verify(&buf) {
-                    if p.pubkey == candidate.pubkey
-                        && (p.flags & FLAG_ACCEPT) != 0
-                        && p.peer_fpr == my_fpr
-                    {
-                        let peer = TrustedPeer {
-                            pubkey: candidate.pubkey,
-                            name: candidate.name.clone(),
-                            paired_at: now_iso8601(),
-                            last_seen_addr: None,
-                        };
-                        if let Err(e) = save_trust(&cfg.state_dir, &peer) {
-                            let msg = format!("save trust: {e:?}");
-                            ui.on_failed(&msg);
-                            return PairOutcome::IoError(io::Error::other("save trust"));
-                        }
-                        ui.on_paired(&peer);
-                        return PairOutcome::Paired(peer);
+            Ok((n, _src)) if n >= PACKET_LEN => {
+                // `recv_from` may deliver more than PACKET_LEN on some paths
+                // (jumbo padding, datagram fragmentation reassembly); slice
+                // to the canonical body before verify.
+                let Ok(p) = packet::verify(&buf[..PACKET_LEN]) else { continue };
+                if !packet_in_replay_window(&p) { continue; }
+                if p.pubkey == candidate.pubkey
+                    && (p.flags & FLAG_ACCEPT) != 0
+                    && p.peer_fpr == my_fpr
+                {
+                    let peer = TrustedPeer {
+                        pubkey: candidate.pubkey,
+                        name: candidate.name.clone(),
+                        paired_at: now_iso8601(),
+                        last_seen_addr: None,
+                    };
+                    if let Err(e) = save_trust(&cfg.state_dir, &peer) {
+                        let msg = format!("save trust: {e:?}");
+                        ui.on_failed(&msg);
+                        return PairOutcome::IoError(io::Error::other("save trust"));
                     }
+                    ui.on_paired(&peer);
+                    return PairOutcome::Paired(peer);
                 }
             }
             Ok(_) => {}
@@ -182,6 +219,70 @@ pub fn run_pair_with<U: PairUI>(cfg: &PairConfig, ui: &mut U) -> PairOutcome {
         }
     }
     // SenderHandle::Drop signals stop and joins.
+}
+
+enum CollectOutcome {
+    Candidates(Vec<PairCandidate>),
+    Timeout,
+    IoError(io::Error),
+}
+
+/// Buffer every distinct PAIRING peer seen during `CANDIDATE_COLLECT_WINDOW`
+/// once the first one shows up. Returns as soon as the window elapses with
+/// at least one candidate that hasn't been previously declined, or on the
+/// outer pair-flow deadline.
+fn collect_candidates(
+    cfg: &PairConfig,
+    buf: &mut [u8; PACKET_LEN],
+    declined: &HashSet<[u8; PUBKEY_LEN]>,
+    deadline: Instant,
+) -> CollectOutcome {
+    let mut seen: HashSet<[u8; PUBKEY_LEN]> = HashSet::new();
+    let mut candidates: Vec<PairCandidate> = Vec::new();
+    let mut window_close: Option<Instant> = None;
+
+    loop {
+        let now = Instant::now();
+        if now >= deadline {
+            return CollectOutcome::Timeout;
+        }
+        if let Some(close) = window_close {
+            if now >= close && !candidates.is_empty() {
+                return CollectOutcome::Candidates(candidates);
+            }
+        }
+        match cfg.recv_sock.recv_from(buf) {
+            Ok((n, _src)) if n >= PACKET_LEN => {
+                let Ok(p) = packet::verify(&buf[..PACKET_LEN]) else { continue };
+                if (p.flags & FLAG_PAIRING) == 0 || p.pubkey == cfg.identity.pubkey {
+                    continue;
+                }
+                if declined.contains(&p.pubkey) || !seen.insert(p.pubkey) {
+                    continue;
+                }
+                if !packet_in_replay_window(&p) {
+                    continue;
+                }
+                candidates.push(PairCandidate {
+                    pubkey: p.pubkey,
+                    name: p.name,
+                });
+                if window_close.is_none() {
+                    window_close = Some(now + CANDIDATE_COLLECT_WINDOW);
+                }
+            }
+            Ok(_) => {}
+            Err(e) if matches!(e.kind(), io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut) => {}
+            Err(e) => return CollectOutcome::IoError(e),
+        }
+    }
+}
+
+#[allow(clippy::cast_possible_truncation)]
+fn packet_in_replay_window(p: &BeaconPacket) -> bool {
+    let now32 = now_us() as u32;
+    let pkt32 = p.timestamp_us as u32;
+    is_within_replay_window(pkt32, now32, REPLAY_WINDOW_US)
 }
 
 struct SendCtx {
@@ -207,7 +308,7 @@ impl SenderHandle {
         let state_for_thread = state.clone();
         let handle = thread::Builder::new()
             .name("pair-sender".into())
-            .spawn(move || sender_loop(ctx, state_for_thread))
+            .spawn(move || sender_loop(&ctx, &state_for_thread))
             .ok();
         Self { state, handle }
     }
@@ -222,7 +323,7 @@ impl Drop for SenderHandle {
     }
 }
 
-fn sender_loop(ctx: SendCtx, state: Arc<SendState>) {
+fn sender_loop(ctx: &SendCtx, state: &Arc<SendState>) {
     let mut next = Instant::now();
     while !state.stop.load(Ordering::Relaxed) {
         let now = Instant::now();
@@ -233,7 +334,7 @@ fn sender_loop(ctx: SendCtx, state: Arc<SendState>) {
             } else {
                 [0; FPR_LEN]
             };
-            send_one_with_sock(&ctx, flags, peer_fpr);
+            send_one_with_sock(ctx, flags, peer_fpr);
             // Phase 1 is fine at 1 Hz; phase 3 wants ~5 Hz to keep the
             // accept-exchange window tight.
             let interval = if flags & FLAG_ACCEPT != 0 {
