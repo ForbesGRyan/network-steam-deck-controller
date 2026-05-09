@@ -15,6 +15,7 @@ use discovery::{BEACON_PORT, DECK_PID, DECK_VID};
 use crate::connection::{Action, Connection, RealRunner, State};
 use crate::control;
 use crate::firewall::PeerLock;
+use crate::inhibit::IdleInhibit;
 use crate::sysfs::find_deck_busid;
 
 const TICK_INTERVAL: Duration = Duration::from_millis(500);
@@ -155,6 +156,9 @@ pub fn run(args: Args) {
     // Tracks the firewall rule lifetime; populated on Action::Bind, dropped
     // on Action::Unbind or when the daemon exits.
     let mut peer_lock: Option<PeerLock> = None;
+    // Logind idle:sleep inhibitor lifetime; same shape as peer_lock. Held
+    // only while Bound so a paused / unattached Deck still suspends normally.
+    let mut idle_inhibit: Option<IdleInhibit> = None;
 
     eprintln!("entering tick loop (interval = {} ms)", TICK_INTERVAL.as_millis());
     let mut last_status: Option<control::Status> = None;
@@ -167,7 +171,8 @@ pub fn run(args: Args) {
         let effective_peer_present = beacon_present && !paused;
         if let Some(action) = conn.tick(effective_peer_present, &mut runner) {
             eprintln!("connection: {action:?} (state={:?})", conn.state());
-            apply_firewall(action, &beacon, &mut peer_lock);
+            apply_firewall(action.clone(), &beacon, &mut peer_lock);
+            apply_inhibit(action, &mut idle_inhibit);
         }
         // Refresh the firewall rule if the peer's DHCP lease renewed under
         // us. Without this the rule still ACCEPTs the old IP and DROPs the
@@ -225,6 +230,7 @@ pub fn run(args: Args) {
     eprintln!("shutdown signal — unbinding");
     let _ = conn.tick(false, &mut runner);
     drop(peer_lock);
+    drop(idle_inhibit);
     let _ = control::clear_status(&args.control_dir);
 }
 
@@ -253,6 +259,17 @@ fn apply_firewall(
         }
         Action::Unbind => {
             *peer_lock = None;
+        }
+    }
+}
+
+fn apply_inhibit(action: Action, idle_inhibit: &mut Option<IdleInhibit>) {
+    match action {
+        Action::Bind => {
+            *idle_inhibit = IdleInhibit::acquire();
+        }
+        Action::Unbind => {
+            *idle_inhibit = None;
         }
     }
 }
