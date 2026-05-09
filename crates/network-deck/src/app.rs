@@ -7,7 +7,7 @@
 use std::path::PathBuf;
 use std::process::Child;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use eframe::egui;
 
@@ -60,10 +60,11 @@ pub struct KioskApp {
     /// Shared view of the daemon child's lifecycle. `None` only when we
     /// never even tried to spawn (e.g. not installed yet).
     daemon: Option<Arc<DaemonState>>,
-    /// Set when the user closes the window — paints a "stopping" panel for
-    /// one frame so we can synchronously SIGTERM-and-wait the daemon
-    /// before letting the close go through.
-    shutting_down: bool,
+    /// Set when the user closes the window. Drives the "Stopping…" panel
+    /// while we wait for the daemon to exit (= controller released back to
+    /// the Deck). Holds the moment we sent SIGTERM so we can show elapsed
+    /// time and escalate to SIGKILL after the grace window.
+    shutdown_started: Option<Instant>,
     /// Snapshot of the environment at startup — visible from any failure
     /// panel so the user can see (and copy) exactly what the kiosk
     /// resolved without re-launching from a terminal.
@@ -79,7 +80,7 @@ impl KioskApp {
             self_exe: None,
             daemon_child: None,
             daemon: None,
-            shutting_down: false,
+            shutdown_started: None,
             boot_log: Vec::new(),
         }
     }
@@ -162,21 +163,19 @@ impl KioskApp {
 impl eframe::App for KioskApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         // Window-close handling. eframe fires `close_requested` on X-button
-        // clicks; we cancel the close once, paint a "stopping" panel,
-        // synchronously drop the daemon child (waits for usbip unbind),
-        // then send Close to actually exit. This guarantees the controller
-        // is released back to the Deck — relying on Drop alone is brittle
-        // because some platforms shortcut process::exit on close.
-        if ctx.input(|i| i.viewport().close_requested()) && self.daemon_child.is_some() {
+        // clicks; we cancel the close, send SIGTERM, then poll the daemon
+        // each frame until it exits (controller released) — at which point
+        // we drop the child and send Close. Synchronous Drop would freeze
+        // the GUI for the entire usbip-unbind window.
+        if ctx.input(|i| i.viewport().close_requested())
+            && self.daemon_child.is_some()
+            && self.shutdown_started.is_none()
+        {
             ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
-            self.shutting_down = true;
+            self.begin_shutdown();
         }
-        if self.shutting_down {
-            self.draw_shutting_down(ctx);
-            // Drop the daemon synchronously after one paint so the user
-            // sees the "stopping" message, then close on the next frame.
-            self.daemon_child = None;
-            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+        if self.shutdown_started.is_some() {
+            self.tick_shutdown(ctx);
             return;
         }
 
@@ -209,9 +208,7 @@ impl eframe::App for KioskApp {
             // Exit button clicked — flow into the same path as the window
             // X-button so the daemon is SIGTERMed and the controller
             // released before we actually close.
-            self.shutting_down = true;
-            // Skip the 250 ms idle wait: we want the "Stopping…" panel up
-            // immediately so the user has feedback while we tear down.
+            self.begin_shutdown();
             ctx.request_repaint();
         } else {
             ctx.request_repaint_after(Duration::from_millis(250));
@@ -345,15 +342,75 @@ impl KioskApp {
         exit_clicked
     }
 
-    fn draw_shutting_down(&self, ctx: &egui::Context) {
+    /// Hard cap on how long we wait for the daemon to exit gracefully
+    /// before SIGKILL. usbip-unbind shells out to userspace and can take
+    /// hundreds of ms; 5 s is a comfortable upper bound that still feels
+    /// bounded if something is genuinely wedged.
+    const SHUTDOWN_GRACE: Duration = Duration::from_secs(5);
+
+    /// Called once when the user requests close. Sends SIGTERM and starts
+    /// the timer; subsequent frames poll via `tick_shutdown`.
+    fn begin_shutdown(&mut self) {
+        if self.shutdown_started.is_some() {
+            return;
+        }
+        if let Some(child) = &self.daemon_child {
+            child.request_shutdown();
+        }
+        self.shutdown_started = Some(Instant::now());
+    }
+
+    /// Polled each frame while shutting down. Paints progress, escalates
+    /// to SIGKILL after the grace window, and finally drops the child +
+    /// closes the viewport once the daemon has exited.
+    fn tick_shutdown(&mut self, ctx: &egui::Context) {
+        let started = self.shutdown_started.expect("tick_shutdown without begin_shutdown");
+        let elapsed = started.elapsed();
+        let finished = self
+            .daemon_child
+            .as_ref()
+            .is_none_or(DaemonChild::is_finished);
+
+        let timed_out = !finished && elapsed >= Self::SHUTDOWN_GRACE;
+        if timed_out {
+            if let Some(child) = &self.daemon_child {
+                eprintln!("daemon ignored SIGTERM after 5s — escalating to SIGKILL");
+                child.force_kill();
+            }
+        }
+
+        self.draw_shutting_down(ctx, elapsed, timed_out);
+
+        if finished || timed_out {
+            // Either reaped cleanly, or we're done waiting. Drop is fast
+            // because the waiter has already finished (or we just SIGKILLed).
+            self.daemon_child = None;
+            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+            return;
+        }
+        // Repaint frequently so the elapsed counter and spinner stay live.
+        ctx.request_repaint_after(Duration::from_millis(100));
+    }
+
+    fn draw_shutting_down(&self, ctx: &egui::Context, elapsed: Duration, timed_out: bool) {
         egui::CentralPanel::default().show(ctx, |ui| {
             ui.vertical_centered_justified(|ui| {
                 ui.add_space(80.0);
                 ui.heading(egui::RichText::new("Stopping…").size(48.0));
                 ui.add_space(20.0);
+                let body = if timed_out {
+                    "Daemon didn't exit in time. Forcing close —\n\
+                     the controller may stay bound to usbip-host.\n\
+                     Re-launch and tap Pause if it does."
+                } else {
+                    "Releasing the controller back to the Deck."
+                };
+                ui.label(egui::RichText::new(body).size(20.0));
+                ui.add_space(20.0);
                 ui.label(
-                    egui::RichText::new("Releasing the controller back to the Deck.")
-                        .size(20.0),
+                    egui::RichText::new(format!("({:.1}s)", elapsed.as_secs_f32()))
+                        .size(14.0)
+                        .weak(),
                 );
                 ui.add_space(40.0);
                 ui.spinner();

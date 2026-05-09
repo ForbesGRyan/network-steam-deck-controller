@@ -167,32 +167,58 @@ impl DaemonChild {
 
         Ok((Self { pid, waiter }, state))
     }
+
+    /// Send SIGTERM without blocking. Pair with `is_finished()` polling so
+    /// the GUI can paint a "Stopping…" frame instead of freezing on Drop.
+    /// Idempotent — extra SIGTERMs to a dead pid are harmless.
+    pub fn request_shutdown(&self) {
+        unsafe {
+            #[allow(clippy::cast_possible_wrap)]
+            libc::kill(self.pid as i32, libc::SIGTERM);
+        }
+    }
+
+    /// Send SIGKILL. Last-resort escalation when the daemon ignored SIGTERM
+    /// past the GUI's grace window. Controller may stay bound to usbip-host
+    /// in that case.
+    pub fn force_kill(&self) {
+        unsafe {
+            #[allow(clippy::cast_possible_wrap)]
+            libc::kill(self.pid as i32, libc::SIGKILL);
+        }
+    }
+
+    /// True once the waiter thread has reaped the child. Cheap; safe to
+    /// call every frame.
+    #[must_use]
+    pub fn is_finished(&self) -> bool {
+        self.waiter.as_ref().is_none_or(std::thread::JoinHandle::is_finished)
+    }
 }
 
 impl Drop for DaemonChild {
     fn drop(&mut self) {
         let Some(handle) = self.waiter.take() else { return };
-        // PID-reuse safe: only signal if the waiter hasn't already reaped.
-        if !handle.is_finished() {
-            unsafe {
-                #[allow(clippy::cast_possible_wrap)]
-                libc::kill(self.pid as i32, libc::SIGTERM);
-            }
+        // Fast path: GUI drove shutdown via request_shutdown + polling and
+        // only dropped us once is_finished() returned true. Just join.
+        if handle.is_finished() {
+            let _ = handle.join();
+            return;
         }
-        // Wait up to 5 s for the daemon to actually exit — this is what
-        // releases the controller back to the Deck. `usbip unbind` shells
-        // out to the userspace tool, so it can take ~hundreds of ms even
-        // on a fast machine.
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        // Fallback path: abnormal exit (panic, untracked Drop). Best-effort
+        // SIGTERM, brief wait, then SIGKILL — bounded so we don't freeze on
+        // process teardown.
+        unsafe {
+            #[allow(clippy::cast_possible_wrap)]
+            libc::kill(self.pid as i32, libc::SIGTERM);
+        }
+        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(500);
         while std::time::Instant::now() < deadline {
             if handle.is_finished() { break; }
             std::thread::sleep(std::time::Duration::from_millis(50));
         }
-        // If the daemon hasn't exited by the deadline, escalate to SIGKILL
-        // so we don't hang the GUI on close. Controller may stay bound to
-        // usbip-host in that case — pathological and worth logging.
         if !handle.is_finished() {
-            eprintln!("daemon ignored SIGTERM after 5s — escalating to SIGKILL");
+            eprintln!("daemon ignored SIGTERM after 500ms in Drop — SIGKILL");
             unsafe {
                 #[allow(clippy::cast_possible_wrap)]
                 libc::kill(self.pid as i32, libc::SIGKILL);
