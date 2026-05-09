@@ -10,6 +10,8 @@
 //! their unit tests run on every platform.
 
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+mod bind_error;
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 mod connection;
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 mod control;
