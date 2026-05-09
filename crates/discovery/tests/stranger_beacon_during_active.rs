@@ -18,6 +18,7 @@ fn ephemeral() -> SocketAddr {
 
 // `discovery::time` is pub(crate); inline an equivalent helper here rather
 // than widening the discovery public API for one test.
+#[allow(clippy::cast_possible_truncation)]
 fn now_us() -> u64 {
     use std::time::{SystemTime, UNIX_EPOCH};
     SystemTime::now()
