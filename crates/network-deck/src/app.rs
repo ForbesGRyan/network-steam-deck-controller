@@ -4,18 +4,29 @@
 //! unit-tested. The `update` impl only handles painting and dispatching
 //! button taps to the on-disk control surface in `control.rs`.
 
+use crate::control::Status;
+
+#[cfg(target_os = "linux")]
 use std::path::PathBuf;
+#[cfg(target_os = "linux")]
 use std::process::Child;
+#[cfg(target_os = "linux")]
 use std::sync::Arc;
+#[cfg(target_os = "linux")]
 use std::time::{Duration, Instant};
 
+#[cfg(target_os = "linux")]
 use eframe::egui;
 
-use crate::control::{self, Status};
+#[cfg(target_os = "linux")]
+use crate::control;
+#[cfg(target_os = "linux")]
 use crate::daemon_child::{DaemonChild, DaemonState, Escalation};
+#[cfg(target_os = "linux")]
 use crate::pair_worker::{PairWorker, Phase as PairPhase};
 
 /// Setup state machine for the first-run screen.
+#[cfg(target_os = "linux")]
 enum SetupPhase {
     /// Showing instructions + "Install now" button.
     Idle,
@@ -27,12 +38,14 @@ enum SetupPhase {
     Failed(String),
 }
 
+#[cfg(target_os = "linux")]
 struct SetupState {
     self_exe: PathBuf,
     phase: SetupPhase,
 }
 
 /// Pre-pair flow: we have an installed binary but no trust file yet.
+#[cfg(target_os = "linux")]
 struct PairState {
     identity: Arc<discovery::Identity>,
     self_name: String,
@@ -45,6 +58,7 @@ struct PairState {
     last_error: Option<String>,
 }
 
+#[cfg(target_os = "linux")]
 pub struct KioskApp {
     control_dir: PathBuf,
     /// Present iff the binary detected we're not yet installed. Drives the
@@ -71,6 +85,7 @@ pub struct KioskApp {
     boot_log: Vec<String>,
 }
 
+#[cfg(target_os = "linux")]
 impl KioskApp {
     pub fn new(control_dir: PathBuf) -> Self {
         Self {
@@ -160,6 +175,7 @@ impl KioskApp {
     }
 }
 
+#[cfg(target_os = "linux")]
 impl eframe::App for KioskApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         // Window-close handling. eframe fires `close_requested` on X-button
@@ -216,6 +232,7 @@ impl eframe::App for KioskApp {
     }
 }
 
+#[cfg(target_os = "linux")]
 impl KioskApp {
     /// Default status panel — heading + big toggle button + Vol±/touch hint.
     /// When `status.json` is missing, also draws a diagnostics block so the
@@ -792,6 +809,7 @@ impl KioskApp {
     }
 }
 
+#[cfg(target_os = "linux")]
 fn spawn_installer(self_exe: &std::path::Path) -> std::io::Result<Child> {
     // pkexec triggers the polkit auth agent (graphical password prompt on KDE
     // / GNOME / Steam Deck Desktop Mode). The child re-execs us with `install`,
@@ -816,7 +834,7 @@ fn spawn_installer(self_exe: &std::path::Path) -> std::io::Result<Child> {
         .spawn()
 }
 
-/// Detect SteamOS Game Mode (gamescope-session). Used to gate UI flows
+/// Detect `SteamOS` Game Mode (gamescope-session). Used to gate UI flows
 /// that require a graphical polkit auth agent — pkexec, the in-app
 /// installer, etc. — none of which work in Game Mode by default.
 ///
@@ -825,13 +843,26 @@ fn spawn_installer(self_exe: &std::path::Path) -> std::io::Result<Child> {
 ///   - `XDG_CURRENT_DESKTOP=gamescope` — set by gamescope-session.
 ///   - `XDG_SESSION_DESKTOP` containing "gamescope" — same, alt name.
 fn is_gamescope_session() -> bool {
-    if std::env::var("SteamGamepadUI").as_deref() == Ok("1") {
+    is_gamescope_from_env(|k| std::env::var(k).ok())
+}
+
+/// Detect a gamescope-session session from a generic env-var reader.
+/// Pure — caller supplies the lookup, so tests can hand in a mock map
+/// instead of mutating the process env (unsound in multi-threaded tests).
+///
+/// Returns `true` if any of:
+/// - `SteamGamepadUI` is exactly `"1"`
+/// - `XDG_CURRENT_DESKTOP` contains the substring `"gamescope"` (case-insensitive)
+/// - `XDG_SESSION_DESKTOP` contains the substring `"gamescope"` (case-insensitive)
+fn is_gamescope_from_env<F>(get: F) -> bool
+where
+    F: Fn(&str) -> Option<String>,
+{
+    if get("SteamGamepadUI").as_deref() == Some("1") {
         return true;
     }
     let env_contains = |key: &str, needle: &str| {
-        std::env::var(key)
-            .map(|v| v.to_ascii_lowercase().contains(needle))
-            .unwrap_or(false)
+        get(key).is_some_and(|v| v.to_ascii_lowercase().contains(needle))
     };
     env_contains("XDG_CURRENT_DESKTOP", "gamescope")
         || env_contains("XDG_SESSION_DESKTOP", "gamescope")
@@ -970,5 +1001,133 @@ mod tests {
         let without_name = status(None, true, true, false);
         let v = derive_view(Some(&without_name));
         assert_eq!(v.text, "Ready for client");
+    }
+
+    // Gap-fillers in the bind_error × state matrix. The existing
+    // bind_error_propagates_into_view test covers `Preparing for ...` only;
+    // these pin propagation through the rest of the states.
+
+    #[test]
+    fn bind_error_propagates_when_paused() {
+        let mut s = status(Some("desktop"), true, true, true);
+        s.bind_error = Some("usbip bind failed 4 times".into());
+        let v = derive_view(Some(&s));
+        assert_eq!(v.text, "Paused");
+        assert_eq!(v.bind_error.as_deref(), Some("usbip bind failed 4 times"));
+    }
+
+    #[test]
+    fn bind_error_propagates_when_searching() {
+        let mut s = status(None, false, false, false);
+        s.bind_error = Some("usbip bind failed 6 times".into());
+        let v = derive_view(Some(&s));
+        assert_eq!(v.text, "Searching for client\u{2026}");
+        assert_eq!(v.bind_error.as_deref(), Some("usbip bind failed 6 times"));
+    }
+
+    #[test]
+    fn bind_error_propagates_when_ready() {
+        let mut s = status(Some("desktop"), true, true, false);
+        s.bind_error = Some("usbip bind failed 3 times".into());
+        let v = derive_view(Some(&s));
+        assert_eq!(v.text, "Ready for desktop");
+        assert_eq!(v.bind_error.as_deref(), Some("usbip bind failed 3 times"));
+    }
+
+    #[test]
+    fn bind_error_propagates_when_daemon_not_running() {
+        // None status still surfaces any leftover bind_error read from disk
+        // before the daemon disappeared. Behaviour is "show whatever was last
+        // observed" so the kiosk doesn't drop the diagnostic on a daemon
+        // restart blip.
+        let v = derive_view(None);
+        assert_eq!(v.text, "Daemon not running");
+        // No status → no bind_error to propagate.
+        assert_eq!(v.bind_error, None);
+    }
+
+    #[test]
+    fn paused_state_takes_precedence_over_unbound_or_no_peer() {
+        // Spec: paused is checked BEFORE peer_present and bound. Verify the
+        // matching order so a future refactor doesn't regress the priority.
+        let s = status(Some("desktop"), false, false, true);
+        let v = derive_view(Some(&s));
+        assert_eq!(v.text, "Paused");
+        assert_eq!(v.toggle_to, Some(false), "should target unpause, not pause");
+    }
+
+    #[test]
+    fn unbound_with_peer_renders_preparing_not_ready() {
+        // peer_present=true, bound=false → "Preparing", NOT "Ready". Pin the
+        // distinction so a swap of the two arms surfaces in CI.
+        let s = status(Some("steamdeck-pc"), true, false, false);
+        let v = derive_view(Some(&s));
+        assert!(
+            v.text.starts_with("Preparing for"),
+            "got: {} (must distinguish bound vs preparing)",
+            v.text,
+        );
+        assert!(!v.text.starts_with("Ready"));
+    }
+
+    // Gamescope-session detection. The pure helper takes an env lookup so
+    // tests don't mutate process env (unsound under threading).
+
+    #[test]
+    fn gamescope_detected_via_steam_gamepad_ui() {
+        let env = |k: &str| if k == "SteamGamepadUI" { Some("1".into()) } else { None };
+        assert!(is_gamescope_from_env(env));
+    }
+
+    #[test]
+    fn gamescope_not_detected_when_steam_gamepad_ui_is_not_one() {
+        // The check is `== Some("1")`, not "set"; "0" or "true" must NOT trigger.
+        let env0 = |k: &str| if k == "SteamGamepadUI" { Some("0".into()) } else { None };
+        assert!(!is_gamescope_from_env(env0));
+        let env_true = |k: &str| if k == "SteamGamepadUI" { Some("true".into()) } else { None };
+        assert!(!is_gamescope_from_env(env_true));
+    }
+
+    #[test]
+    fn gamescope_detected_via_xdg_current_desktop_substring() {
+        let env1 = |k: &str| if k == "XDG_CURRENT_DESKTOP" { Some("gamescope".into()) } else { None };
+        assert!(is_gamescope_from_env(env1));
+        // Substring match: real-world values like "gamescope-session" must
+        // also trigger.
+        let env2 = |k: &str| if k == "XDG_CURRENT_DESKTOP" { Some("gamescope-session".into()) } else { None };
+        assert!(is_gamescope_from_env(env2));
+    }
+
+    #[test]
+    fn gamescope_detected_via_xdg_session_desktop_substring() {
+        let env = |k: &str| if k == "XDG_SESSION_DESKTOP" { Some("gamescope".into()) } else { None };
+        assert!(is_gamescope_from_env(env));
+    }
+
+    #[test]
+    fn gamescope_detection_is_case_insensitive_on_xdg_vars() {
+        // Some session managers uppercase the value; case-insensitive match
+        // keeps the heuristic from missing real gamescope sessions.
+        let env_mixed = |k: &str| if k == "XDG_CURRENT_DESKTOP" { Some("Gamescope".into()) } else { None };
+        assert!(is_gamescope_from_env(env_mixed));
+        let env_upper = |k: &str| if k == "XDG_CURRENT_DESKTOP" { Some("GAMESCOPE".into()) } else { None };
+        assert!(is_gamescope_from_env(env_upper));
+    }
+
+    #[test]
+    fn gamescope_not_detected_in_a_kde_plasma_session() {
+        // Realistic Desktop-Mode env: KDE Plasma on SteamOS without Game Mode.
+        let env = |k: &str| match k {
+            "XDG_CURRENT_DESKTOP" => Some("KDE".into()),
+            "XDG_SESSION_DESKTOP" => Some("plasma".into()),
+            _ => None,
+        };
+        assert!(!is_gamescope_from_env(env));
+    }
+
+    #[test]
+    fn gamescope_not_detected_with_no_relevant_vars() {
+        let empty = |_k: &str| None::<String>;
+        assert!(!is_gamescope_from_env(empty));
     }
 }

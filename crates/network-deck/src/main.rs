@@ -18,7 +18,7 @@ mod control;
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 mod sysfs;
 
-#[cfg(target_os = "linux")]
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 mod app;
 #[cfg(target_os = "linux")]
 mod daemon;
