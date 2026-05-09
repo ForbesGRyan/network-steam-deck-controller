@@ -298,10 +298,35 @@ These scenarios are not run because the lab in this pass has only one
 Deck and one Win PC. Each is a known coverage gap, not a tested pass:
 
 - **Stranger Deck rejection (B.2)** — Requires a second Deck (or a
-  fabricated mismatched-pubkey beacon). Mitigation: pair flow's Ed25519
-  identity check is unit-tested in `crates/discovery/`; an integration
-  test against a synthetic stranger beacon could close this gap without
-  hardware.
+  fabricated mismatched-pubkey beacon). **Closed (logic level)** by
+  automated regression tests landed 2026-05-09: see `beacon::tests::
+  stranger_does_not_overwrite_active_peer` in `crates/discovery/src/
+  beacon.rs` (in-process) and the wire-level integration test
+  `crates/discovery/tests/stranger_beacon_during_active.rs`. A real
+  second-Deck run remains a follow-up but the rejection path has
+  hardware-free coverage.
+
+- **Peer IP change behaviour (D.5)** — **Closed (logic level)** by
+  `beacon::tests::peer_ip_change_updates_live_addr` in
+  `crates/discovery/src/beacon.rs`. Hardware test of a real DHCP renew
+  mid-session remains a follow-up but the bind-refresh path is now
+  pinned by a regression test.
+
+- **Repeat bind failure surfacing (D.6)** — **Closed (logic level)** by
+  the extracted `bind_error::from_failure_count` helper and its three
+  tests in `crates/network-deck/src/bind_error.rs`. Hardware test of the
+  threshold being reached during a live `usbipd` outage remains a
+  follow-up.
+
+- **Wi-Fi blip recovery (D.1 / D.2)** — **Closed (logic level)** for the
+  Windows attach state machine by `attach::tests::detach_then_reattach_
+  within_one_backoff_cycle` in `crates/client-win/src/attach.rs`. Real
+  Wi-Fi-blip-on-the-wire timing remains a hardware-only check.
+
+- **Replay-window defense** — **Closed** by `beacon::tests::handle_
+  packet_outside_replay_window_dropped` in `crates/discovery/src/
+  beacon.rs`. Not a spec scenario but called out in the implementation
+  plan as defense-in-depth.
 - **Multi-LAN segment** — UDP broadcast scope is not exercised across
   routed segments.
 - **Multi-hour soak (>1 h)** — Phase C.6 caps at 60 min. A 4–8 h run is
