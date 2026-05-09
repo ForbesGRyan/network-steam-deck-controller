@@ -4,6 +4,7 @@
 //! state transitions are unit-testable. Production wiring uses `RealRunner`,
 //! which shells out to `/usr/bin/usbip`.
 
+use std::path::PathBuf;
 use std::process::Command;
 
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
@@ -22,11 +23,36 @@ pub trait CommandRunner {
     fn run_usbip(&mut self, args: &[&str]) -> bool;
 }
 
-pub struct RealRunner;
+pub struct RealRunner {
+    usbip: PathBuf,
+}
+
+#[cfg(target_os = "linux")]
+impl RealRunner {
+    /// Resolve `usbip` once via the same $PATH-hardening helper used by the
+    /// rest of the codebase. Falls back to a bare `usbip` if absent so dev
+    /// environments without a system install still work — logged so it's
+    /// obvious why a later bind might fail.
+    #[must_use]
+    pub fn new() -> Self {
+        let usbip = crate::install::absolute_path_for("usbip").unwrap_or_else(|| {
+            eprintln!("warning: usbip not found in standard bin dirs; falling back to PATH lookup");
+            PathBuf::from("usbip")
+        });
+        Self { usbip }
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl Default for RealRunner {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
 impl CommandRunner for RealRunner {
     fn run_usbip(&mut self, args: &[&str]) -> bool {
-        Command::new("usbip")
+        Command::new(&self.usbip)
             .args(args)
             .status()
             .map(|s| s.success())

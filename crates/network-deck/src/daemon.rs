@@ -125,7 +125,7 @@ pub fn run(args: Args) {
     super::hotkey::spawn(args.control_dir.clone());
 
     let mut conn = Connection::new(busid.clone());
-    let mut runner = RealRunner;
+    let mut runner = RealRunner::new();
     // Tracks the firewall rule lifetime; populated on Action::Bind, dropped
     // on Action::Unbind or when the daemon exits.
     let mut peer_lock: Option<PeerLock> = None;
