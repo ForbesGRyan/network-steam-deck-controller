@@ -1,30 +1,21 @@
-# network-usb
+# Network Steam Deck Controller
 
-Use a Steam Deck as a wireless controller for a Windows PC.
+Turn your Steam Deck into a wireless gamepad for a Windows PC.
 
-## Why this exists
+## Why
 
-A stepping stone to a real Steam Controller. I couldn't grab one on launch
-day, like a lot of people, so I wanted to use my Steam Deck as the
-controller for my PC in the meantime. Steam Link had too much latency and
-drained the Deck's battery too fast to be usable. This sips battery and
-adds less latency, because it's only a USB-bus tunnel — fewer round
-trips back to the PC, no video stream, no encode/decode.
+Couldn't get a Steam Controller at launch — like a lot of people. The
+Deck was sitting right there, but Steam Link was too laggy and chewed
+through battery. So instead of streaming the game to the Deck, this
+streams the Deck's controller to the PC: just the USB bus, no video, no
+encode/decode. Lower latency, lighter on battery.
 
-Built on stock USB/IP: `usbipd` on the Deck, `usbip-win2` on Windows.
-This repo is the discovery + lifecycle glue that finds the peer, attaches
-the controller, and reattaches when Wi-Fi blips. Steam Input sees a real
-Deck controller, so every game with Deck support just works.
+It's a thin layer of discovery and lifecycle glue around stock USB/IP
+(`usbipd` on the Deck, `usbip-win2` on Windows): finds the peer,
+attaches the controller, reattaches when Wi-Fi blips. Steam Input sees
+a real Deck controller, so every game with Deck support just works.
 
 See [ARCHITECTURE.md](ARCHITECTURE.md) for the design and tradeoffs.
-
-## Layout
-
-```
-crates/discovery/      Ed25519 identity, signed UDP beacon, pair flow
-crates/network-deck/   Single Deck binary: GUI + daemon + pair + installer
-crates/client-win/     Windows tray app driving usbip.exe attach
-```
 
 ## Install
 
