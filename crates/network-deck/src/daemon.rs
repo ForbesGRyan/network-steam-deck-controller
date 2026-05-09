@@ -152,6 +152,29 @@ pub fn run(args: Args) {
             eprintln!("connection: {action:?} (state={:?})", conn.state());
             apply_firewall(action, &beacon, &mut peer_lock);
         }
+        // Refresh the firewall rule if the peer's DHCP lease renewed under
+        // us. Without this the rule still ACCEPTs the old IP and DROPs the
+        // new one, so the kiosk reads "Connected" while Windows can't
+        // attach. Only act when we have a fresh, definitively different IP
+        // — a transient "no IPv4 from beacon" must not churn the rule.
+        if matches!(conn.state(), State::Bound) {
+            if let (Some(lock), Some(new_ip)) = (peer_lock.as_ref(), current_peer_ipv4(&beacon)) {
+                let old_ip = lock.peer();
+                if old_ip != new_ip {
+                    eprintln!(
+                        "firewall: peer IP changed {old_ip} -> {new_ip}, refreshing rule"
+                    );
+                    // Drop first so the old rule is uninstalled before the
+                    // new one goes in — avoids two ACCEPTs on different IPs
+                    // simultaneously when the backend is iptables.
+                    peer_lock = None;
+                    match PeerLock::install(new_ip) {
+                        Ok(lock) => peer_lock = lock,
+                        Err(e) => eprintln!("firewall: refresh install failed: {e}"),
+                    }
+                }
+            }
+        }
         let status = control::Status {
             peer_name: Some(trusted.name.clone()),
             peer_present: beacon_present,

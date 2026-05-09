@@ -65,6 +65,13 @@ impl PeerLock {
         Ok(Some(Self { backend, tool, peer }))
     }
 
+    /// IP this lock is currently pinned to. Used by the daemon to detect
+    /// peer DHCP-lease renewals so the rule can be refreshed.
+    #[must_use]
+    pub fn peer(&self) -> Ipv4Addr {
+        self.peer
+    }
+
     fn uninstall(&self) {
         let ok = match self.backend {
             Backend::Nft => uninstall_nft(&self.tool),
@@ -178,4 +185,25 @@ fn run(tool: &PathBuf, args: &[&str]) -> bool {
         .status()
         .map(|s| s.success())
         .unwrap_or(false)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn peer_accessor_returns_install_ip() {
+        // Hand-construct a PeerLock — install() shells out to nft/iptables,
+        // so we can't exercise the real construction in a unit test. The
+        // accessor is dumb glue, but the daemon's IP-change refresh logic
+        // depends on it returning what install() recorded.
+        let lock = PeerLock {
+            backend: Backend::Iptables,
+            tool: PathBuf::from("/bin/true"),
+            peer: Ipv4Addr::new(192, 168, 1, 42),
+        };
+        assert_eq!(lock.peer(), Ipv4Addr::new(192, 168, 1, 42));
+        // Don't run uninstall on Drop — would shell out and fail.
+        std::mem::forget(lock);
+    }
 }
