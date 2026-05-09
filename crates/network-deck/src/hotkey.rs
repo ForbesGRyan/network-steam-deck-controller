@@ -20,7 +20,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use evdev::{Device, EventSummary, KeyCode};
+use evdev::{Device, EventSummary, KeyCode, SynchronizationCode};
 
 /// Pairs of keys whose simultaneous press toggles paused state.
 const CHORDS: &[(KeyCode, KeyCode)] = &[(KeyCode::KEY_VOLUMEUP, KeyCode::KEY_VOLUMEDOWN)];
@@ -103,9 +103,12 @@ fn run_listener(
                 return;
             }
         };
+        // Track SYN_DROPPED outside the iterator so we can re-borrow `dev`
+        // mutably to re-query state after the for loop ends.
+        let mut resync = false;
         for ev in events {
-            if let EventSummary::Key(_, key, value) = ev.destructure() {
-                match value {
+            match ev.destructure() {
+                EventSummary::Key(_, key, value) => match value {
                     1 => {
                         pressed.insert(key);
                     }
@@ -113,7 +116,28 @@ fn run_listener(
                         pressed.remove(&key);
                     }
                     _ => {} // 2 = autorepeat — keep state as-is.
+                },
+                EventSummary::Synchronization(_, code, _)
+                    if code == SynchronizationCode::SYN_DROPPED =>
+                {
+                    resync = true;
                 }
+                _ => {}
+            }
+        }
+        if resync {
+            // Kernel ring buffer overflowed and dropped events — our
+            // `pressed` set is now unreliable. Re-query the device for the
+            // current key state and rebuild from scratch.
+            pressed.clear();
+            match dev.get_key_state() {
+                Ok(keys) => {
+                    for k in keys.iter() {
+                        pressed.insert(k);
+                    }
+                    eprintln!("hotkey: SYN_DROPPED — resynced key state");
+                }
+                Err(e) => eprintln!("hotkey: get_key_state after SYN_DROPPED: {e}"),
             }
         }
 
