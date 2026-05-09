@@ -293,6 +293,11 @@ fn write_sudoers(_user: &str, install_bin: &std::path::Path) -> std::io::Result<
     chmod(std::path::Path::new(SUDOERS_PATH), 0o440)?;
     if !run_ok("visudo", &["-c", "-f", SUDOERS_PATH]) {
         eprintln!("visudo validation failed for {SUDOERS_PATH}");
+        // A malformed file under /etc/sudoers.d/ makes sudo refuse to load
+        // any rules in the directory — users get "not in sudoers" with no
+        // recovery path. Remove the partial file so the host stays usable.
+        let _ = std::fs::remove_file(SUDOERS_PATH);
+        eprintln!("removed {SUDOERS_PATH} to keep sudo functional");
         std::process::exit(1);
     }
     Ok(())
