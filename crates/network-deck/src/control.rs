@@ -65,7 +65,6 @@ pub fn read_status(dir: &Path) -> Option<Status> {
 /// (missing file, permission denied, parse error). Used by the kiosk's
 /// diagnostics panel to disambiguate "no daemon" from "wrong dir" from
 /// "garbage on disk".
-#[must_use]
 pub fn read_status_diag(dir: &Path) -> Result<Status, String> {
     let path = dir.join("status.json");
     let bytes = match fs::read(&path) {
