@@ -24,7 +24,7 @@ mod app;
 mod daemon;
 #[cfg(target_os = "linux")]
 mod daemon_child;
-#[cfg(target_os = "linux")]
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 mod firewall;
 #[cfg(target_os = "linux")]
 mod hotkey;
