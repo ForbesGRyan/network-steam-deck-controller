@@ -313,4 +313,29 @@ mod tests {
         let after = beacon.current_peer().unwrap();
         assert_eq!(after, trusted_addr, "stranger must not overwrite live peer");
     }
+
+    #[test]
+    fn handle_packet_outside_replay_window_dropped() {
+        let me = make_identity();
+        let them = make_identity();
+        let peer = make_peer(them.pubkey);
+        let dest = "127.0.0.1:1".parse().unwrap();
+        let beacon = Beacon::new(me, peer.clone(), vec![dest], "me".into(), 49152).unwrap();
+
+        // Timestamp far enough in the past that low-32-bit wrap-aware diff
+        // exceeds REPLAY_WINDOW_US (30 s). 5 minutes is comfortably outside.
+        let stale_us = now_us().saturating_sub(5 * 60 * 1_000_000);
+        let pkt = BeaconPacket {
+            flags: 0,
+            pubkey: them.pubkey,
+            peer_fpr: fingerprint(&beacon.identity.pubkey),
+            timestamp_us: stale_us,
+            name: "them".into(),
+        };
+        let mut buf = [0_u8; PACKET_LEN];
+        packet::sign_into(&them.signing, &pkt, &mut buf).unwrap();
+        beacon.handle_packet("192.168.1.42:55555".parse().unwrap(), &buf);
+
+        assert_eq!(beacon.current_peer(), None, "stale-timestamp packet must be dropped");
+    }
 }
