@@ -266,4 +266,36 @@ mod tests {
         a.tick(true, Some("h"), t0 + Duration::from_secs(12), &mut d);
         assert_eq!(d.attach_calls.len(), 4);
     }
+
+    #[test]
+    fn detach_then_reattach_within_one_backoff_cycle() {
+        let mut a = Attach::new(Duration::from_secs(1), Duration::from_secs(30));
+        let mut d = MockDriver {
+            busid_for: Some("3-3".into()),
+            attach_succeeds: true,
+            ported: vec!["3-3".into()],
+            ..Default::default()
+        };
+        let t0 = now();
+
+        // Initial attach.
+        let action = a.tick(true, Some("h"), t0, &mut d);
+        assert_eq!(action, Some(Action::Attach { host: "h".into(), busid: "3-3".into() }));
+        assert_eq!(a.state(), State::Attached);
+
+        // Wi-Fi blip: kernel drops the busid from the port list, peer still seen.
+        d.ported.clear();
+        let action = a.tick(true, Some("h"), t0 + Duration::from_secs(1), &mut d);
+        assert_eq!(action, Some(Action::LostAttachment));
+        assert_eq!(a.state(), State::Idle);
+
+        // Wi-Fi recovers next tick. Backoff should be `base` (1 s) because the
+        // last attach was a SUCCESS — failures didn't bump it. So a tick at
+        // t+2 s must fire a new attach.
+        d.ported = vec!["3-3".into()];
+        let action = a.tick(true, Some("h"), t0 + Duration::from_secs(2), &mut d);
+        assert_eq!(action, Some(Action::Attach { host: "h".into(), busid: "3-3".into() }));
+        assert_eq!(a.state(), State::Attached);
+        assert_eq!(d.attach_calls.len(), 2, "blip should produce exactly 2 attach calls");
+    }
 }
