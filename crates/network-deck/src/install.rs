@@ -8,7 +8,7 @@
 //!   3. Enables `usbipd.service` (system-managed, auto-starts at boot).
 //!   4. Disables the old `network-deck-server.service` if it exists.
 //!   5. Copies `argv[0]` to `/var/lib/network-deck/network-deck` (root-owned).
-//!      `/var/lib/` is writable on SteamOS and avoids `$HOME` collisions
+//!      `/var/lib/` is writable on `SteamOS` and avoids `$HOME` collisions
 //!      (a binary-named-`network-deck` already in your home would otherwise
 //!      block creating a directory with the same name).
 //!   6. Writes `/etc/sudoers.d/network-deck` (NOPASSWD for daemon launch).
@@ -91,6 +91,7 @@ pub fn run() -> std::io::Result<()> {
 ///   - the trust file + identity in `$HOME/.local/state/network-deck`.
 ///     That's user data, not install state. `rm -rf` it manually if you
 ///     want a fully clean test slate.
+#[allow(clippy::unnecessary_wraps)]
 pub fn uninstall() -> std::io::Result<()> {
     if !is_root() {
         eprintln!("uninstall must be run as root: sudo network-deck uninstall");
@@ -146,13 +147,19 @@ pub fn uninstall() -> std::io::Result<()> {
     Ok(())
 }
 
+#[cfg(target_os = "linux")]
 fn is_root() -> bool {
     // SAFETY: getuid() is signal-safe and trivially correct.
     unsafe { libc::getuid() == 0 }
 }
 
+#[cfg(not(target_os = "linux"))]
+fn is_root() -> bool {
+    false
+}
+
 /// Allow `^[a-z0-9_][a-z0-9_-]*$`. The classic POSIX rule reserves leading
-/// digits, but SteamOS Family Share creates per-account local users with
+/// digits, but `SteamOS` Family Share creates per-account local users with
 /// fully-numeric names (e.g. `496325425`), so refusing them locks those
 /// users out of install. The constraint that matters for sudoers safety
 /// — no whitespace, no newlines, no shell or sudoers metas — still holds.
@@ -182,6 +189,7 @@ fn home_for(user: &str) -> Option<PathBuf> {
         })
 }
 
+#[allow(clippy::unnecessary_wraps)]
 fn ensure_usbip_userspace() -> std::io::Result<()> {
     if which_present("usbip") {
         return Ok(());
@@ -212,6 +220,7 @@ fn ensure_usbip_userspace() -> std::io::Result<()> {
     Ok(())
 }
 
+#[allow(clippy::unnecessary_wraps)]
 fn load_kernel_modules() -> std::io::Result<()> {
     eprintln!(">> Loading kernel modules...");
     for m in ["usbip-core", "usbip-host", "vhci-hcd"] {
@@ -262,6 +271,25 @@ fn copy_self_to(dest: &std::path::Path) -> std::io::Result<()> {
     Ok(())
 }
 
+/// The contents of `/etc/sudoers.d/network-deck` as written by `install`.
+/// Pure — no I/O. Tested in `mod tests`. The visudo validation step in
+/// `write_sudoers` will reject anything malformed at install time, but
+/// the unit tests here pin the structure (user-agnostic ALL rule,
+/// NOPASSWD bound to the daemon subcommand, comment block intact).
+#[must_use]
+pub(super) fn sudoers_body(install_bin: &Path) -> String {
+    format!(
+        "# Allow any local user to launch the network-deck daemon without a\n\
+         # password prompt. SteamOS Family Share + Game Mode users vary, and\n\
+         # pkexec is unreliable in gamescope-session, so user-keyed rules\n\
+         # silently lock those accounts out of the kiosk. The grant is bound\n\
+         # to a root-owned binary at a fixed path (see install.rs).\n\
+         ALL ALL=(root) NOPASSWD: {bin} daemon\n",
+        bin = install_bin.display(),
+    )
+}
+
+#[allow(clippy::unnecessary_wraps)]
 fn write_sudoers(_user: &str, install_bin: &std::path::Path) -> std::io::Result<()> {
     // User-agnostic rule. Original design keyed on `$SUDO_USER`, but on
     // SteamOS:
@@ -280,15 +308,7 @@ fn write_sudoers(_user: &str, install_bin: &std::path::Path) -> std::io::Result<
     // root-owned in the user's home if anyone did invoke `sudo … pair`.
     // The binary path is root-owned (chmod 0755 set above) so a non-root
     // user cannot swap it out to ride the rule.
-    let body = format!(
-        "# Allow any local user to launch the network-deck daemon without a\n\
-         # password prompt. SteamOS Family Share + Game Mode users vary, and\n\
-         # pkexec is unreliable in gamescope-session, so user-keyed rules\n\
-         # silently lock those accounts out of the kiosk. The grant is bound\n\
-         # to a root-owned binary at a fixed path (see install.rs).\n\
-         ALL ALL=(root) NOPASSWD: {bin} daemon\n",
-        bin = install_bin.display(),
-    );
+    let body = sudoers_body(install_bin);
     // Wrap write + chmod + visudo so any failure removes the partial file
     // before propagating. A broken file under /etc/sudoers.d/ makes sudo
     // refuse to load any rules in the directory — users get "not in
@@ -314,14 +334,13 @@ fn write_sudoers(_user: &str, install_bin: &std::path::Path) -> std::io::Result<
     Ok(())
 }
 
-fn write_desktop(
-    user: &str,
-    app_dir: &std::path::Path,
-    desktop_path: &std::path::Path,
-    install_bin: &std::path::Path,
-) -> std::io::Result<()> {
-    std::fs::create_dir_all(app_dir)?;
-    let body = format!(
+/// The contents of `network-deck-kiosk.desktop` as written by `install`.
+/// Pure — no I/O. Tested in `mod tests`. Pins the Exec line to the
+/// install-time binary path so the kiosk launches the same root-owned
+/// binary that the sudoers grant trusts.
+#[must_use]
+pub(super) fn desktop_body(install_bin: &Path) -> String {
+    format!(
         "[Desktop Entry]\n\
          Type=Application\n\
          Name=Network Deck\n\
@@ -331,7 +350,17 @@ fn write_desktop(
          Terminal=false\n\
          Categories=Game;\n",
         bin = install_bin.display(),
-    );
+    )
+}
+
+fn write_desktop(
+    user: &str,
+    app_dir: &std::path::Path,
+    desktop_path: &std::path::Path,
+    install_bin: &std::path::Path,
+) -> std::io::Result<()> {
+    std::fs::create_dir_all(app_dir)?;
+    let body = desktop_body(install_bin);
     eprintln!(">> Writing {}", desktop_path.display());
     std::fs::write(desktop_path, body)?;
     chown_warn(app_dir, user, user);
@@ -413,18 +442,22 @@ pub fn is_installed() -> bool {
     std::path::Path::new(SUDOERS_PATH).exists()
 }
 
+/// Root-owned prefix trees that are safe install sources on every supported distro.
+/// `/usr/local/` is intentionally absent: on Arch / `SteamOS`-derived distros it's
+/// often user-writable for ad-hoc installs, which would defeat the check.
+const SAFE_PREFIXES: &[&str] = &["/usr/bin/", "/usr/sbin/", "/usr/lib/", "/usr/libexec/"];
+
 /// `true` iff `path` sits in a tree that's root-owned on every supported
 /// distro. Used to gate `pkexec` invocations: a user-writable tree means
 /// any local user can trojan the binary and ride the elevation.
 ///
-/// Excludes `/usr/local/`: on Arch / SteamOS-derived distros it's often
+/// Excludes `/usr/local/`: on Arch / `SteamOS`-derived distros it's often
 /// user-writable for ad-hoc installs, which would defeat the check.
 #[must_use]
 pub fn is_safe_install_source(path: &Path) -> bool {
     if path == Path::new(INSTALL_BIN) {
         return true;
     }
-    const SAFE_PREFIXES: &[&str] = &["/usr/bin/", "/usr/sbin/", "/usr/lib/", "/usr/libexec/"];
     SAFE_PREFIXES.iter().any(|p| path.starts_with(p))
 }
 
@@ -453,5 +486,106 @@ mod tests {
         assert!(!is_valid_username("user name"));
         assert!(!is_valid_username("user$"));
         assert!(!is_valid_username("a".repeat(33).as_str()));
+    }
+
+    #[test]
+    fn sudoers_body_grants_only_daemon_subcommand_to_all_users() {
+        let body = sudoers_body(Path::new("/var/lib/network-deck/network-deck"));
+        // The whole point of the user-agnostic rule.
+        assert!(body.contains("ALL ALL=(root) NOPASSWD: /var/lib/network-deck/network-deck daemon\n"));
+        // The grant must NOT extend to other subcommands (`pair`, `install`,
+        // `uninstall`) — pairing runs in-process as the user, install/uninstall
+        // require explicit sudo. A wildcard like `*` here would silently broaden
+        // the privilege.
+        assert!(!body.contains("NOPASSWD: ALL"));
+        assert!(!body.contains("daemon *"));
+    }
+
+    #[test]
+    fn sudoers_body_ends_with_newline() {
+        // sudo ignores the last line if it has no terminating LF, so a
+        // missing newline silently breaks the install. Pin it.
+        let body = sudoers_body(Path::new("/var/lib/network-deck/network-deck"));
+        assert!(body.ends_with('\n'), "got: {body:?}");
+    }
+
+    #[test]
+    fn sudoers_body_substitutes_install_bin_path() {
+        let body = sudoers_body(Path::new("/usr/local/bin/nd"));
+        assert!(body.contains("/usr/local/bin/nd daemon"), "got: {body}");
+    }
+
+    #[test]
+    fn desktop_body_has_required_desktop_entry_keys() {
+        let body = desktop_body(Path::new("/var/lib/network-deck/network-deck"));
+        assert!(body.starts_with("[Desktop Entry]\n"));
+        for required in ["Type=Application", "Name=", "Exec=", "Categories="] {
+            assert!(body.contains(required), "missing {required:?} in: {body}");
+        }
+    }
+
+    #[test]
+    fn desktop_body_exec_points_at_install_bin() {
+        let body = desktop_body(Path::new("/opt/nd/bin"));
+        assert!(body.contains("Exec=/opt/nd/bin\n"), "got: {body}");
+    }
+
+    #[test]
+    fn desktop_body_terminal_false_so_kiosk_does_not_open_konsole() {
+        // If Terminal=true, KDE/Plasma launches the kiosk inside a Konsole
+        // window — visible breakage in Game Mode where there is no terminal
+        // emulator. Pin the flag.
+        let body = desktop_body(Path::new("/var/lib/network-deck/network-deck"));
+        assert!(body.contains("Terminal=false"), "got: {body}");
+    }
+
+    #[test]
+    fn modules_load_body_lists_all_three_usbip_modules() {
+        // Lost from the constant means usbip-host won't auto-load on boot;
+        // the daemon then fails its first bind. Pin the list.
+        for m in ["usbip-core", "usbip-host", "vhci-hcd"] {
+            assert!(MODULES_LOAD_BODY.contains(m), "missing {m} in {MODULES_LOAD_BODY:?}");
+        }
+        assert!(MODULES_LOAD_BODY.ends_with('\n'));
+    }
+
+    #[test]
+    fn is_safe_install_source_accepts_canonical_root_owned_dirs() {
+        for ok in [
+            "/usr/bin/network-deck",
+            "/usr/sbin/foo",
+            "/usr/lib/some/binary",
+            "/usr/libexec/whatever",
+        ] {
+            assert!(is_safe_install_source(Path::new(ok)), "should accept: {ok}");
+        }
+    }
+
+    #[test]
+    fn is_safe_install_source_accepts_install_bin_exactly() {
+        // The install destination itself is always safe (root-chowned during install).
+        assert!(is_safe_install_source(Path::new(INSTALL_BIN)));
+    }
+
+    #[test]
+    fn is_safe_install_source_rejects_user_writable_locations() {
+        for bad in [
+            "/tmp/network-deck",
+            "/home/deck/network-deck",
+            "/var/tmp/foo",
+            // Per the doc-comment, /usr/local is excluded on Arch / SteamOS
+            // because it's commonly user-writable.
+            "/usr/local/bin/network-deck",
+            "/dev/shm/x",
+        ] {
+            assert!(!is_safe_install_source(Path::new(bad)), "should reject: {bad}");
+        }
+    }
+
+    #[test]
+    fn absolute_path_for_returns_none_for_impossible_name() {
+        // No command on PATH should plausibly be named like this; verifies
+        // the lookup loop terminates with None on every supported host.
+        assert!(absolute_path_for("definitely-not-a-real-binary-xyzzy123").is_none());
     }
 }

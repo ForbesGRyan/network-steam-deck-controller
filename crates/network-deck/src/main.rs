@@ -28,7 +28,7 @@ mod daemon_child;
 mod firewall;
 #[cfg(target_os = "linux")]
 mod hotkey;
-#[cfg(target_os = "linux")]
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 mod install;
 #[cfg(target_os = "linux")]
 mod pair_worker;
