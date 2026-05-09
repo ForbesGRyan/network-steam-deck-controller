@@ -72,8 +72,7 @@ pub fn run() -> std::io::Result<()> {
     eprintln!("Done.");
     eprintln!();
     eprintln!("Next: pair with your Windows PC (run on each side at once):");
-    eprintln!("  sudo {}", install_bin.display());
-    eprintln!("    pair");
+    eprintln!("  {} pair", install_bin.display());
     eprintln!("  client-win.exe pair    # on Windows");
     eprintln!();
     eprintln!("Use:");
@@ -274,18 +273,20 @@ fn write_sudoers(_user: &str, install_bin: &std::path::Path) -> std::io::Result<
     // sessions ("sudo: a password is required" with no recovery path in
     // Game Mode, since pkexec also can't prompt without a polkit agent).
     //
-    // The grant is narrowly scoped — only `{INSTALL_BIN} daemon` and
-    // `... pair`, both of which the binary itself sandboxes (one exits
-    // after pairing, the other runs the bind/unbind state machine on a
-    // known busid). The binary path is root-owned (chmod 0755 set above)
-    // so a non-root user cannot swap it out to ride the rule.
+    // The grant is narrowly scoped — only `{INSTALL_BIN} daemon`. Pairing
+    // runs in-process as the user (pair_worker) and writes to
+    // `~/.local/state/network-deck/`, so it never needs sudo; granting it
+    // here was dead privilege and would also leave the trust file
+    // root-owned in the user's home if anyone did invoke `sudo … pair`.
+    // The binary path is root-owned (chmod 0755 set above) so a non-root
+    // user cannot swap it out to ride the rule.
     let body = format!(
         "# Allow any local user to launch the network-deck daemon without a\n\
          # password prompt. SteamOS Family Share + Game Mode users vary, and\n\
          # pkexec is unreliable in gamescope-session, so user-keyed rules\n\
          # silently lock those accounts out of the kiosk. The grant is bound\n\
          # to a root-owned binary at a fixed path (see install.rs).\n\
-         ALL ALL=(root) NOPASSWD: {bin} daemon, {bin} pair\n",
+         ALL ALL=(root) NOPASSWD: {bin} daemon\n",
         bin = install_bin.display(),
     );
     // Wrap write + chmod + visudo so any failure removes the partial file
