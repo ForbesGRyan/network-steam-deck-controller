@@ -101,9 +101,8 @@ Decision history (most recent first):
   GUI window stops the daemon and unbinds the controller — no systemd
   unit involved.
 - `crates/client-win/` — Windows binary. Tray app that drives
-  `usbip.exe attach` based on beacon state.
-- `scripts/install-windows.ps1` — Windows-side installer (usbip-win2 +
-  binary drop).
+  `usbip.exe attach` based on beacon state. Self-installs usbip-win2 on
+  first launch if `usbip.exe` is missing.
 
 ## Wire protocol
 

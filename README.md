@@ -24,7 +24,6 @@ See [ARCHITECTURE.md](ARCHITECTURE.md) for the design and tradeoffs.
 crates/discovery/      Ed25519 identity, signed UDP beacon, pair flow
 crates/network-deck/   Single Deck binary: GUI + daemon + pair + installer
 crates/client-win/     Windows tray app driving usbip.exe attach
-scripts/install-windows.ps1
 ```
 
 ## Build
@@ -52,14 +51,11 @@ entry for the GUI→daemon hop, drops a `.desktop` file. Add
 `~/network-deck/network-deck` to Steam from Desktop Mode and it shows up
 in your Game Mode library.
 
-**Windows (elevated PowerShell):**
+**Windows:**
 
-```powershell
-.\scripts\install-windows.ps1
-```
-
-Installs usbip-win2 (accept the driver dialog), drops `client-win.exe`
-into `%LOCALAPPDATA%\NetworkDeck`, registers tray autostart on first run.
+Drop `client-win.exe` anywhere and double-click. First launch prompts to
+install usbip-win2 silently (UAC + Windows driver-signing dialog), then
+registers tray autostart.
 
 ## Pair
 
@@ -85,8 +81,8 @@ unbinds the controller before exiting — no leftover background process.
 - **Controller drops mid-game:** Wi-Fi blip looks like a USB unplug under
   TCP. The state machine reattaches automatically; some games need a
   restart to pick the controller back up.
-- **vhci stuck after suspend:** rerun `install-windows.ps1` (idempotent)
-  or restart the usbip-win2 service.
+- **vhci stuck after suspend:** restart the usbip-win2 service, or
+  reinstall it (the tray app will offer this if `usbip.exe` is missing).
 - **Kiosk stuck on "First-time setup":** tap **Install** (uses pkexec).
   If pkexec isn't available, run `sudo network-deck install` from
   Konsole instead.

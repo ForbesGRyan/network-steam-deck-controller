@@ -68,6 +68,10 @@ mod attach;
 #[cfg(windows)]
 mod autostart;
 #[cfg(windows)]
+mod dialogs;
+#[cfg(windows)]
+mod installer;
+#[cfg(windows)]
 mod pair_dialog;
 #[cfg(windows)]
 mod tray;
@@ -149,6 +153,12 @@ fn main() {
 }
 
 fn run_normal(identity: &Arc<discovery::Identity>, state_dir: &std::path::Path) {
+    // Ensure usbip-win2 is present before the user pairs or we start the
+    // tray. Prompts the user and runs the elevated installer if missing;
+    // exits the process if the user declines or the install fails.
+    #[cfg(windows)]
+    installer::ensure_installed_or_exit();
+
     let trusted = match discovery::trust::load(state_dir) {
         Ok(Some(p)) => Arc::new(p),
         Ok(None) => {
@@ -377,28 +387,15 @@ fn run_attach_loop(
 /// up cleanly on the next launch. Always diverges.
 #[cfg(windows)]
 fn first_run_pair(identity: Arc<discovery::Identity>, state_dir: &std::path::Path) -> ! {
-    use windows_sys::Win32::UI::WindowsAndMessaging::{
-        MessageBoxW, MB_ICONINFORMATION, MB_OK,
-    };
-
-    // Heads-up dialog so the user can put the Deck in pair mode before we
-    // start broadcasting. The pair flow has its own 120 s timeout once we
-    // proceed; this dialog is the chance to hit Cancel via window close.
-    let title = util::wide("Network Deck — first-time pair");
-    let body = util::wide(
+    // Heads-up so the user can put the Deck in pair mode before we start
+    // broadcasting. The pair flow has its own 120 s timeout once we
+    // proceed; this dialog is the chance to back out by closing it.
+    dialogs::info(
+        "Network Deck — first-time pair",
         "No paired Deck found.\n\n\
          On the Deck, launch Network Deck and tap \"Start pairing\".\n\
          Click OK to start pairing on this PC.",
     );
-    // SAFETY: NUL-terminated UTF-16 strings, null hwnd, valid flags.
-    unsafe {
-        MessageBoxW(
-            std::ptr::null_mut(),
-            body.as_ptr(),
-            title.as_ptr(),
-            MB_OK | MB_ICONINFORMATION,
-        );
-    }
 
     let bind_addr = SocketAddr::new(Ipv4Addr::UNSPECIFIED.into(), DEFAULT_PORT);
     let sock = UdpSocket::bind(bind_addr).unwrap_or_else(|e| {
