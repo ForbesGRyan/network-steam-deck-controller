@@ -70,9 +70,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             install::run()?;
             Ok(())
         }
+        Some("uninstall") => {
+            install::uninstall()?;
+            Ok(())
+        }
         Some(other) => {
             eprintln!("unknown subcommand: {other}");
-            eprintln!("usage: network-deck [daemon|pair|install]");
+            eprintln!("usage: network-deck [daemon|pair|install|uninstall]");
             std::process::exit(2);
         }
         None => run_gui(),
@@ -100,6 +104,34 @@ fn run_gui() -> Result<(), Box<dyn std::error::Error>> {
     };
     let state_dir = default_state_dir();
 
+    let mut app = app::KioskApp::new(control_dir.clone());
+
+    // Snapshot the runtime environment up front. Mirrored to stderr by
+    // `log_boot` and rendered inside the kiosk's diagnostics panel so the
+    // user can see what we resolved without launching from a terminal.
+    app.log_boot(format!(
+        "USER={} SUDO_USER={} HOME={}",
+        std::env::var("USER").unwrap_or_else(|_| "<unset>".into()),
+        std::env::var("SUDO_USER").unwrap_or_else(|_| "<unset>".into()),
+        std::env::var("HOME").unwrap_or_else(|_| "<unset>".into()),
+    ));
+    app.log_boot(format!(
+        "session: SteamGamepadUI={} XDG_CURRENT_DESKTOP={} XDG_SESSION_DESKTOP={}",
+        std::env::var("SteamGamepadUI").unwrap_or_else(|_| "<unset>".into()),
+        std::env::var("XDG_CURRENT_DESKTOP").unwrap_or_else(|_| "<unset>".into()),
+        std::env::var("XDG_SESSION_DESKTOP").unwrap_or_else(|_| "<unset>".into()),
+    ));
+    app.log_boot(format!("self_exe = {}", self_exe.display()));
+    app.log_boot(format!("daemon_exe = {}", daemon_exe.display()));
+    app.log_boot(format!("control_dir = {}", control_dir.display()));
+    app.log_boot(format!("state_dir = {}", state_dir.display()));
+    app.log_boot(format!(
+        "INSTALL_BIN exists = {}",
+        std::path::Path::new(install::INSTALL_BIN).exists(),
+    ));
+    app.log_boot(format!("installed = {installed} (sudoers file present)"));
+    app.log_boot(format!("paired = {paired} (trust file present)"));
+
     // Three startup screens, in priority order:
     //   1. Not installed   → setup screen, polkit-driven `install`.
     //   2. Installed but   → in-app pair flow. Don't spawn the daemon yet
@@ -107,10 +139,15 @@ fn run_gui() -> Result<(), Box<dyn std::error::Error>> {
     //   3. Installed +     → spawn daemon child, show normal status panel.
     //      paired
     let (daemon_child, daemon_state) = if installed && paired {
+        app.log_boot("daemon: spawning via `sudo -n network-deck daemon`");
         match daemon_child::DaemonChild::spawn(&daemon_exe) {
-            Ok((child, state)) => (Some(child), Some(state)),
+            Ok((child, state)) => {
+                app.log_boot("daemon: spawn ok — waiting for first status.json tick");
+                (Some(child), Some(state))
+            }
             Err(e) => {
                 eprintln!("spawn daemon: {e}");
+                app.log_boot(format!("daemon: spawn FAILED — {e}"));
                 let state = std::sync::Arc::new(daemon_child::DaemonState::default());
                 if let Ok(mut tail) = state.stderr_tail.lock() {
                     tail.push(format!("could not start daemon: {e}"));
@@ -123,10 +160,13 @@ fn run_gui() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
     } else {
+        app.log_boot(
+            "daemon: NOT spawned — kiosk is in setup or pair mode, or both. \
+             Status panel will be empty until install + pair complete.",
+        );
         (None, None)
     };
 
-    let mut app = app::KioskApp::new(control_dir.clone());
     if !installed {
         app = app.with_setup_required(self_exe.clone());
     } else if !paired {
@@ -140,8 +180,14 @@ fn run_gui() -> Result<(), Box<dyn std::error::Error>> {
         app = app.with_daemon(daemon_exe.clone(), daemon_child, state);
     }
 
+    // `inner_size` is the initial window size; `maximized` is a WM hint.
+    // KDE (Desktop Mode) honors maximize and fills the screen. Gamescope
+    // (Game Mode) ignores it, so the window stays at the inner_size we
+    // request — 1280×800 happens to be the Deck's native screen, so the
+    // app fills it there too.
     let native_options = eframe::NativeOptions {
         viewport: eframe::egui::ViewportBuilder::default()
+            .with_inner_size([1280.0, 800.0])
             .with_maximized(true)
             .with_title("Network Deck"),
         ..Default::default()

@@ -27,6 +27,20 @@ pub struct Args {
 
 #[allow(clippy::too_many_lines)] // run() is a top-level boot sequence; splitting it costs more readability than it saves
 pub fn run(args: Args) {
+    // Mirror the kiosk's boot log: print resolved env up front so we can
+    // diagnose path mismatches between GUI and daemon (different
+    // control_dir, state_dir, etc.) without re-running by hand.
+    eprintln!(
+        "daemon boot: USER={} SUDO_USER={} HOME={} XDG_RUNTIME_DIR={}",
+        std::env::var("USER").unwrap_or_else(|_| "<unset>".into()),
+        std::env::var("SUDO_USER").unwrap_or_else(|_| "<unset>".into()),
+        std::env::var("HOME").unwrap_or_else(|_| "<unset>".into()),
+        std::env::var("XDG_RUNTIME_DIR").unwrap_or_else(|_| "<unset>".into()),
+    );
+    eprintln!("daemon boot: control_dir = {}", args.control_dir.display());
+    eprintln!("daemon boot: state_dir   = {}", args.state_dir.display());
+    eprintln!("daemon boot: sysfs_root  = {}", args.sysfs_root.display());
+
     let identity = Arc::new(
         discovery::identity::load_or_generate(&args.state_dir).unwrap_or_else(|e| {
             eprintln!("identity load: {e:?}");
@@ -96,8 +110,15 @@ pub fn run(args: Args) {
         identity.fingerprint_str(),
     );
 
-    if let Err(e) = std::fs::create_dir_all(&args.control_dir) {
-        eprintln!("create_dir_all {}: {e}", args.control_dir.display());
+    match std::fs::create_dir_all(&args.control_dir) {
+        Ok(()) => eprintln!(
+            "control_dir ready: {} (will write status.json here every tick)",
+            args.control_dir.display(),
+        ),
+        Err(e) => eprintln!(
+            "create_dir_all {}: {e} — kiosk will see 'no status.json' until this is fixed",
+            args.control_dir.display(),
+        ),
     }
 
     // Spawn the hotkey listener — toggles `paused` on Steam+QAM or Vol±.
@@ -118,7 +139,9 @@ pub fn run(args: Args) {
         let _ = signal_hook::flag::register(sig, term.clone());
     }
 
+    eprintln!("entering tick loop (interval = {} ms)", TICK_INTERVAL.as_millis());
     let mut last_status: Option<control::Status> = None;
+    let mut wrote_first_status = false;
     while !term.load(Ordering::Relaxed) {
         let beacon_present = beacon
             .current_peer_with_age()
@@ -138,8 +161,17 @@ pub fn run(args: Args) {
         // Skip the atomic-rename dance when nothing changed — saves eMMC
         // wear and the kiosk reader's no-op JSON parse on every tick.
         if last_status.as_ref() != Some(&status) {
-            if let Err(e) = control::write_status(&args.control_dir, &status) {
-                eprintln!("control: write_status failed: {e}");
+            match control::write_status(&args.control_dir, &status) {
+                Ok(()) => {
+                    if !wrote_first_status {
+                        eprintln!(
+                            "control: first status.json written at {}",
+                            args.control_dir.join("status.json").display(),
+                        );
+                        wrote_first_status = true;
+                    }
+                }
+                Err(e) => eprintln!("control: write_status failed: {e}"),
             }
             last_status = Some(status);
         }

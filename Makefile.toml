@@ -84,6 +84,21 @@ set -euo pipefail
 sudo ./target/release/network-deck install
 '''
 
+[tasks.uninstall-deck]
+description = "Reverse install-deck: remove sudoers, modules-load, INSTALL_DIR, .desktop. Trust file preserved."
+condition = { platforms = ["linux"] }
+script = '''
+#!/usr/bin/env bash
+set -euo pipefail
+# Prefer the installed copy so we uninstall against the same paths it set
+# up; fall back to the local build if INSTALL_BIN is already gone.
+if [ -x /var/lib/network-deck/network-deck ]; then
+    sudo /var/lib/network-deck/network-deck uninstall
+else
+    sudo ./target/release/network-deck uninstall
+fi
+'''
+
 [tasks.install-win]
 description = "Build client-win + run the Windows installer (Windows, needs admin)"
 condition = { platforms = ["windows"] }

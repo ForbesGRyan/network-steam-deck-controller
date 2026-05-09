@@ -64,6 +64,10 @@ pub struct KioskApp {
     /// one frame so we can synchronously SIGTERM-and-wait the daemon
     /// before letting the close go through.
     shutting_down: bool,
+    /// Snapshot of the environment at startup — visible from any failure
+    /// panel so the user can see (and copy) exactly what the kiosk
+    /// resolved without re-launching from a terminal.
+    boot_log: Vec<String>,
 }
 
 impl KioskApp {
@@ -76,7 +80,17 @@ impl KioskApp {
             daemon_child: None,
             daemon: None,
             shutting_down: false,
+            boot_log: Vec::new(),
         }
+    }
+
+    /// Append a startup-time diagnostic line. Mirrored to stderr so the
+    /// same information shows up under `journalctl --user` / Konsole and
+    /// in the in-app diagnostics panel.
+    pub fn log_boot(&mut self, line: impl Into<String>) {
+        let line = line.into();
+        eprintln!("boot: {line}");
+        self.boot_log.push(line);
     }
 
     #[must_use]
@@ -191,8 +205,45 @@ impl eframe::App for KioskApp {
             return;
         }
 
-        let status = control::read_status(&self.control_dir);
+        if self.draw_status_panel(ctx) {
+            // Exit button clicked — flow into the same path as the window
+            // X-button so the daemon is SIGTERMed and the controller
+            // released before we actually close.
+            self.shutting_down = true;
+            // Skip the 250 ms idle wait: we want the "Stopping…" panel up
+            // immediately so the user has feedback while we tear down.
+            ctx.request_repaint();
+        } else {
+            ctx.request_repaint_after(Duration::from_millis(250));
+        }
+    }
+}
+
+impl KioskApp {
+    /// Default status panel — heading + big toggle button + Vol±/touch hint.
+    /// When `status.json` is missing, also draws a diagnostics block so the
+    /// user can see why (no daemon, daemon alive but quiet, control_dir
+    /// mismatch, etc.) without having to launch from a terminal.
+    /// Returns `true` when the Exit button was clicked this frame; the
+    /// caller flips `shutting_down` so the next frame paints the "Stopping…"
+    /// panel and runs the daemon teardown.
+    fn draw_status_panel(&self, ctx: &egui::Context) -> bool {
+        let mut exit_clicked = false;
+        let status_diag = control::read_status_diag(&self.control_dir);
+        let status = status_diag.as_ref().ok().cloned();
         let view = derive_view(status.as_ref());
+        let status_is_none = status.is_none();
+        let read_reason = status_diag.as_ref().err().cloned();
+        let stderr_tail = self
+            .daemon
+            .as_ref()
+            .map(|d| d.snapshot_tail())
+            .unwrap_or_default();
+        let daemon_phrase = match (self.daemon.is_some(), self.daemon.as_ref().is_some_and(|d| d.is_alive())) {
+            (false, _) => "not spawned (kiosk skipped daemon launch)",
+            (true, true) => "alive but no status.json yet",
+            (true, false) => "exited (see stderr)",
+        };
 
         egui::CentralPanel::default().show(ctx, |ui| {
             ui.vertical_centered_justified(|ui| {
@@ -222,14 +273,71 @@ impl eframe::App for KioskApp {
                     .size(16.0)
                     .weak(),
                 );
+
+                ui.add_space(24.0);
+                let exit_btn = egui::Button::new(
+                    egui::RichText::new("Exit").size(28.0),
+                )
+                .min_size(egui::vec2(ui.available_width(), 80.0));
+                if ui.add(exit_btn).clicked() {
+                    exit_clicked = true;
+                }
+
+                if status_is_none {
+                    ui.add_space(20.0);
+                    ui.separator();
+                    ui.add_space(10.0);
+                    ui.label(egui::RichText::new("Diagnostics").size(20.0).strong());
+                    let read_line = read_reason
+                        .as_deref()
+                        .map(|r| format!("status.json: {r}"))
+                        .unwrap_or_default();
+                    ui.label(
+                        egui::RichText::new(format!(
+                            "Daemon: {daemon_phrase}\n\
+                             control_dir: {}\n\
+                             {read_line}",
+                            self.control_dir.display(),
+                        ))
+                        .size(13.0)
+                        .monospace(),
+                    );
+                    ui.add_space(8.0);
+                    egui::ScrollArea::vertical()
+                        .id_salt("diag-scroll")
+                        .max_height(220.0)
+                        .show(ui, |ui| {
+                            for line in &self.boot_log {
+                                ui.label(egui::RichText::new(line).monospace().size(12.0));
+                            }
+                            if !stderr_tail.is_empty() {
+                                ui.add_space(6.0);
+                                ui.label(
+                                    egui::RichText::new("--- daemon stderr ---")
+                                        .monospace()
+                                        .size(12.0)
+                                        .weak(),
+                                );
+                                for line in stderr_tail
+                                    .iter()
+                                    .rev()
+                                    .take(40)
+                                    .collect::<Vec<_>>()
+                                    .into_iter()
+                                    .rev()
+                                {
+                                    ui.label(
+                                        egui::RichText::new(line).monospace().size(12.0),
+                                    );
+                                }
+                            }
+                        });
+                }
             });
         });
-
-        ctx.request_repaint_after(Duration::from_millis(250));
+        exit_clicked
     }
-}
 
-impl KioskApp {
     fn draw_shutting_down(&self, ctx: &egui::Context) {
         egui::CentralPanel::default().show(ctx, |ui| {
             ui.vertical_centered_justified(|ui| {
@@ -446,6 +554,12 @@ impl KioskApp {
             .map(|d| (d.exit_status(), d.snapshot_tail()))
             .unwrap_or_default();
         let can_escalate = self.self_exe.is_some();
+        // pkexec opens a polkit dialog. In Steam Deck Game Mode (gamescope
+        // session) there's no polkit auth agent and no TTY, so pkexec
+        // bails with "Error creating textual authentication agent". Hide
+        // the button there — clicking it would only spawn a doomed
+        // process and add noise to the stderr tail.
+        let pkexec_usable = !is_gamescope_session();
         let mut intent_retry = false;
         let mut intent_pkexec = false;
 
@@ -487,23 +601,32 @@ impl KioskApp {
                             egui::RichText::new("Restart daemon").size(22.0),
                         )
                         .min_size(egui::vec2(half, 64.0));
+                        if ui.add(retry).clicked() { intent_retry = true; }
+
                         let pkexec = egui::Button::new(
                             egui::RichText::new("Run with password").size(22.0),
                         )
                         .min_size(egui::vec2(half, 64.0));
-                        if ui.add(retry).clicked() { intent_retry = true; }
-                        if ui.add(pkexec).clicked() { intent_pkexec = true; }
+                        if pkexec_usable {
+                            if ui.add(pkexec).clicked() { intent_pkexec = true; }
+                        } else {
+                            ui.add_enabled(false, pkexec);
+                        }
                     });
                     ui.add_space(8.0);
-                    ui.label(
-                        egui::RichText::new(
-                            "Restart re-runs `sudo -n` (relies on the NOPASSWD sudoers\n\
-                             entry written during install).\n\
-                             Run with password falls back to `pkexec` if the sudoers entry\n\
-                             is missing or sudo refuses to run non-interactively.",
-                        )
-                        .size(13.0),
-                    );
+                    let helper_text = if pkexec_usable {
+                        "Restart re-runs `sudo -n` (relies on the NOPASSWD sudoers\n\
+                         entry written during install).\n\
+                         Run with password falls back to `pkexec` if the sudoers entry\n\
+                         is missing or sudo refuses to run non-interactively."
+                    } else {
+                        "Restart re-runs `sudo -n` (relies on the NOPASSWD sudoers\n\
+                         entry written during install).\n\
+                         Run with password is disabled in Game Mode — gamescope-session\n\
+                         has no polkit auth agent. Switch to Desktop Mode if you need\n\
+                         to (re)install or repair the sudoers entry."
+                    };
+                    ui.label(egui::RichText::new(helper_text).size(13.0));
                 }
             });
         });
@@ -627,6 +750,27 @@ fn spawn_installer(self_exe: &std::path::Path) -> std::io::Result<Child> {
         .arg(&canonical)
         .arg("install")
         .spawn()
+}
+
+/// Detect SteamOS Game Mode (gamescope-session). Used to gate UI flows
+/// that require a graphical polkit auth agent — pkexec, the in-app
+/// installer, etc. — none of which work in Game Mode by default.
+///
+/// Signals (any one is sufficient):
+///   - `SteamGamepadUI=1`         — set by the Steam client in Game Mode.
+///   - `XDG_CURRENT_DESKTOP=gamescope` — set by gamescope-session.
+///   - `XDG_SESSION_DESKTOP` containing "gamescope" — same, alt name.
+fn is_gamescope_session() -> bool {
+    if std::env::var("SteamGamepadUI").as_deref() == Ok("1") {
+        return true;
+    }
+    let env_contains = |key: &str, needle: &str| {
+        std::env::var(key)
+            .map(|v| v.to_ascii_lowercase().contains(needle))
+            .unwrap_or(false)
+    };
+    env_contains("XDG_CURRENT_DESKTOP", "gamescope")
+        || env_contains("XDG_SESSION_DESKTOP", "gamescope")
 }
 
 /// `true` iff `path` is the canonical install location or anywhere under

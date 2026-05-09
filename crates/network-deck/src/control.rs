@@ -56,6 +56,23 @@ pub fn read_status(dir: &Path) -> Option<Status> {
     serde_json::from_slice(&bytes).ok()
 }
 
+/// Same as `read_status` but returns a human-readable reason on failure
+/// (missing file, permission denied, parse error). Used by the kiosk's
+/// diagnostics panel to disambiguate "no daemon" from "wrong dir" from
+/// "garbage on disk".
+#[must_use]
+pub fn read_status_diag(dir: &Path) -> Result<Status, String> {
+    let path = dir.join("status.json");
+    let bytes = match fs::read(&path) {
+        Ok(b) => b,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {
+            return Err(format!("not found: {}", path.display()));
+        }
+        Err(e) => return Err(format!("read {}: {e}", path.display())),
+    };
+    serde_json::from_slice(&bytes).map_err(|e| format!("parse {}: {e}", path.display()))
+}
+
 pub fn set_paused(dir: &Path, paused: bool) -> io::Result<()> {
     let path = paused_flag_path(dir);
     if paused {

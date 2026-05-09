@@ -83,13 +83,80 @@ pub fn run() -> std::io::Result<()> {
     Ok(())
 }
 
+/// Reverse of `run`: remove every file and unit `install` touched, in the
+/// reverse order so a partial uninstall leaves the system in a sane shape.
+/// Idempotent — missing files / disabled units are not errors.
+///
+/// Deliberately leaves alone:
+///   - the `usbip` userspace package (pacman-installed; user can keep it).
+///   - the trust file + identity in `$HOME/.local/state/network-deck`.
+///     That's user data, not install state. `rm -rf` it manually if you
+///     want a fully clean test slate.
+pub fn uninstall() -> std::io::Result<()> {
+    if !is_root() {
+        eprintln!("uninstall must be run as root: sudo network-deck uninstall");
+        std::process::exit(1);
+    }
+    let user = std::env::var("SUDO_USER").unwrap_or_else(|_| "deck".to_owned());
+    let home = if is_valid_username(&user) {
+        home_for(&user)
+    } else {
+        None
+    };
+
+    eprintln!(">> Disabling usbipd.service");
+    if !run_ok("systemctl", &["disable", "--now", "usbipd.service"]) {
+        eprintln!("warning: systemctl disable usbipd.service failed (already off?)");
+    }
+
+    eprintln!(">> Removing {SUDOERS_PATH}");
+    if let Err(e) = std::fs::remove_file(SUDOERS_PATH) {
+        if e.kind() != std::io::ErrorKind::NotFound {
+            eprintln!("warning: remove {SUDOERS_PATH}: {e}");
+        }
+    }
+
+    eprintln!(">> Removing {MODULES_LOAD_PATH}");
+    if let Err(e) = std::fs::remove_file(MODULES_LOAD_PATH) {
+        if e.kind() != std::io::ErrorKind::NotFound {
+            eprintln!("warning: remove {MODULES_LOAD_PATH}: {e}");
+        }
+    }
+
+    eprintln!(">> Removing {INSTALL_DIR}");
+    if let Err(e) = std::fs::remove_dir_all(INSTALL_DIR) {
+        if e.kind() != std::io::ErrorKind::NotFound {
+            eprintln!("warning: remove {INSTALL_DIR}: {e}");
+        }
+    }
+
+    if let Some(home) = home {
+        let desktop = home.join(".local/share/applications/network-deck-kiosk.desktop");
+        eprintln!(">> Removing {}", desktop.display());
+        if let Err(e) = std::fs::remove_file(&desktop) {
+            if e.kind() != std::io::ErrorKind::NotFound {
+                eprintln!("warning: remove {}: {e}", desktop.display());
+            }
+        }
+    }
+
+    eprintln!();
+    eprintln!("Done. The trust file + identity were preserved under");
+    eprintln!("  ~/.local/state/network-deck/");
+    eprintln!("Remove that directory manually for a fully clean slate.");
+    Ok(())
+}
+
 fn is_root() -> bool {
     // SAFETY: getuid() is signal-safe and trivially correct.
     unsafe { libc::getuid() == 0 }
 }
 
-/// POSIX portable username syntax: `^[a-z_][a-z0-9_-]*$`. Refuses newlines,
-/// shell metas, and anything else that could escape the sudoers `format!`.
+/// Allow `^[a-z0-9_][a-z0-9_-]*$`. The classic POSIX rule reserves leading
+/// digits, but SteamOS Family Share creates per-account local users with
+/// fully-numeric names (e.g. `496325425`), so refusing them locks those
+/// users out of install. The constraint that matters for sudoers safety
+/// — no whitespace, no newlines, no shell or sudoers metas — still holds.
 #[must_use]
 pub fn is_valid_username(user: &str) -> bool {
     if user.is_empty() || user.len() > 32 {
@@ -97,7 +164,7 @@ pub fn is_valid_username(user: &str) -> bool {
     }
     let mut chars = user.chars();
     let Some(first) = chars.next() else { return false };
-    if !(first.is_ascii_lowercase() || first == '_') {
+    if !(first.is_ascii_lowercase() || first.is_ascii_digit() || first == '_') {
         return false;
     }
     chars.all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_' || c == '-')
@@ -196,13 +263,29 @@ fn copy_self_to(dest: &std::path::Path) -> std::io::Result<()> {
     Ok(())
 }
 
-fn write_sudoers(user: &str, install_bin: &std::path::Path) -> std::io::Result<()> {
-    // `user` is validated by `is_valid_username` upstream (POSIX syntax) — the
-    // format! below cannot be smuggled through with newlines or sudoers metas.
+fn write_sudoers(_user: &str, install_bin: &std::path::Path) -> std::io::Result<()> {
+    // User-agnostic rule. Original design keyed on `$SUDO_USER`, but on
+    // SteamOS:
+    //   - Game Mode under Family Share runs as the per-Steam-account user
+    //     (e.g. `496325425`), not whoever ran `sudo install` from Desktop.
+    //   - Steam can also launch the kiosk via wrappers that surface a
+    //     different effective uid than the install-time SUDO_USER.
+    // Restricting to a single user makes the kiosk silently break in those
+    // sessions ("sudo: a password is required" with no recovery path in
+    // Game Mode, since pkexec also can't prompt without a polkit agent).
+    //
+    // The grant is narrowly scoped — only `{INSTALL_BIN} daemon` and
+    // `... pair`, both of which the binary itself sandboxes (one exits
+    // after pairing, the other runs the bind/unbind state machine on a
+    // known busid). The binary path is root-owned (chmod 0755 set above)
+    // so a non-root user cannot swap it out to ride the rule.
     let body = format!(
-        "# Allow {user} to launch the network-deck daemon without a password\n\
-         # prompt. The daemon needs root for usbip bind/unbind on sysfs.\n\
-         {user} ALL=(root) NOPASSWD: {bin} daemon, {bin} pair\n",
+        "# Allow any local user to launch the network-deck daemon without a\n\
+         # password prompt. SteamOS Family Share + Game Mode users vary, and\n\
+         # pkexec is unreliable in gamescope-session, so user-keyed rules\n\
+         # silently lock those accounts out of the kiosk. The grant is bound\n\
+         # to a root-owned binary at a fixed path (see install.rs).\n\
+         ALL ALL=(root) NOPASSWD: {bin} daemon, {bin} pair\n",
         bin = install_bin.display(),
     );
     eprintln!(">> Writing {SUDOERS_PATH}");
@@ -302,12 +385,14 @@ mod tests {
         assert!(is_valid_username("a"));
         assert!(is_valid_username("user-1"));
         assert!(is_valid_username("u_2"));
+        // SteamOS Family Share accounts.
+        assert!(is_valid_username("496325425"));
+        assert!(is_valid_username("1user"));
     }
 
     #[test]
     fn invalid_usernames_rejected() {
         assert!(!is_valid_username(""));
-        assert!(!is_valid_username("1user"));
         assert!(!is_valid_username("-user"));
         assert!(!is_valid_username("Deck"));
         assert!(!is_valid_username("deck\nroot ALL=(ALL) NOPASSWD:ALL"));

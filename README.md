@@ -66,17 +66,28 @@ reattaches automatically once the beacon comes back.
 
 ## Build from source
 
+There's no cross-compile task — build each side on its native OS.
+
+**Deck binary** — Linux or WSL (Ubuntu/Debian):
+
 ```sh
-cargo build --workspace
-cargo test --workspace
+cargo make build-deck
+sudo ./target/release/network-deck install
 ```
 
-`cargo make build-deck` / `build-win` / `verify` are also wired up
-(`cargo install cargo-make` first).
+**Windows client** — native Windows (PowerShell):
 
-Then for the Deck, `sudo ./target/release/network-deck install`. For
-Windows, copy `target/release/client-win.exe` to a permanent path and
-run it.
+```powershell
+cargo make build-win
+# copy target\release\client-win.exe to its final location, then run it
+```
+
+`cargo make verify` (test + clippy + fmt-check) is cross-platform and
+runs on either side. `cargo install cargo-make` first if you don't
+have it.
+
+> Building from `/mnt/c/...` under WSL works but is slow — clone into
+> the WSL ext4 filesystem (`~/code/...`) for a noticeable speedup.
 
 ## Troubleshooting
 
