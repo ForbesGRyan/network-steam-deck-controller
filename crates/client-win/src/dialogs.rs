@@ -137,18 +137,23 @@ impl eframe::App for ConfirmApp {
             ui.add_space(20.0);
             ui.label(egui::RichText::new(&self.body).size(16.0));
             ui.add_space(20.0);
+            // right_to_left lays items right→left in the order added, so add
+            // `decline` first (rightmost) and `accept` second (left of it).
+            // Pair confirmation puts accept on the left so an accidental
+            // muscle-memory tap on the right edge (where Windows usually
+            // puts OK / primary) doesn't auto-trust an unknown Deck.
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                let accept = egui::Button::new(egui::RichText::new(&self.accept).size(16.0))
-                    .min_size(egui::vec2(120.0, 36.0));
-                if ui.add(accept).clicked() {
-                    *self.result.lock().expect("confirm result mutex") = true;
-                    ctx.send_viewport_cmd(egui::ViewportCommand::Close);
-                }
-                ui.add_space(8.0);
                 let decline = egui::Button::new(egui::RichText::new(&self.decline).size(16.0))
                     .min_size(egui::vec2(120.0, 36.0));
                 if ui.add(decline).clicked() {
                     *self.result.lock().expect("confirm result mutex") = false;
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                }
+                ui.add_space(8.0);
+                let accept = egui::Button::new(egui::RichText::new(&self.accept).size(16.0))
+                    .min_size(egui::vec2(120.0, 36.0));
+                if ui.add(accept).clicked() {
+                    *self.result.lock().expect("confirm result mutex") = true;
                     ctx.send_viewport_cmd(egui::ViewportCommand::Close);
                 }
             });
