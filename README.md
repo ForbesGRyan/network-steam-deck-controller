@@ -22,16 +22,16 @@ See [ARCHITECTURE.md](ARCHITECTURE.md) for the design and tradeoffs.
 Grab the latest binaries from
 [Releases](https://github.com/ForbesGRyan/network-steam-deck-controller/releases/latest).
 
-**Steam Deck** — Desktop Mode → Konsole:
+**Steam Deck** — in Desktop Mode:
 
-```sh
-curl -LO https://github.com/ForbesGRyan/network-steam-deck-controller/releases/latest/download/network-deck-v0.1.0-x86_64-linux
-chmod +x network-deck-v0.1.0-x86_64-linux
-sudo ./network-deck-v0.1.0-x86_64-linux install
-```
-
-Then in Steam (still Desktop Mode), **Add a Non-Steam Game** → browse to
-`/var/lib/network-deck/network-deck`. Switch to Game Mode to launch it.
+1. In your browser, download `network-deck-v0.1.0-x86_64-linux` from the
+   release page above.
+2. In Dolphin (the file manager), right-click the file → **Properties**
+   → **Permissions** → tick **Is executable** → **OK**.
+3. Double-click the file. The kiosk opens with a **First-time setup**
+   screen — tap **Install** and enter your password when prompted.
+4. In Steam, **Add a Non-Steam Game** → browse to
+   `/var/lib/network-deck/network-deck`. Switch to Game Mode to launch.
 
 **Windows** — download `client-win-v0.1.0-x86_64-windows.exe`, drop it in
 `%LOCALAPPDATA%\NetworkDeck\`, and double-click. Accept the UAC + driver
