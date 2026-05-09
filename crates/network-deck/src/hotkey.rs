@@ -17,14 +17,13 @@
 //! Threads are detached. They terminate when the daemon process exits.
 
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use evdev::{Device, EventSummary, KeyCode};
 
 /// Pairs of keys whose simultaneous press toggles paused state.
-const CHORDS: &[(KeyCode, KeyCode)] = &[
-    (KeyCode::KEY_VOLUMEUP, KeyCode::KEY_VOLUMEDOWN),
-];
+const CHORDS: &[(KeyCode, KeyCode)] = &[(KeyCode::KEY_VOLUMEUP, KeyCode::KEY_VOLUMEDOWN)];
 
 /// Debounce: ignore another toggle until this much time has passed since
 /// the last one. Prevents rapid flicker while the chord is held.
@@ -39,10 +38,19 @@ pub fn spawn(control_dir: PathBuf) {
         }
     };
     let mut watched_count = 0_usize;
+    // Shared across all listener threads so cooldown applies globally —
+    // chord events can arrive on multiple devices simultaneously (e.g. duplicate
+    // event nodes for the same physical buttons) and independent per-thread
+    // cooldowns would let pairs of toggles cancel each other out.
+    let last_toggle = Arc::new(Mutex::new(Instant::now() - TOGGLE_COOLDOWN));
     for entry in entries.flatten() {
         let path = entry.path();
-        let Some(name) = path.file_name().and_then(|s| s.to_str()) else { continue };
-        if !name.starts_with("event") { continue; }
+        let Some(name) = path.file_name().and_then(|s| s.to_str()) else {
+            continue;
+        };
+        if !name.starts_with("event") {
+            continue;
+        }
         let dev = match Device::open(&path) {
             Ok(d) => d,
             Err(_) => continue,
@@ -56,7 +64,9 @@ pub fn spawn(control_dir: PathBuf) {
             .filter(|(a, b)| supported.contains(*a) && supported.contains(*b))
             .copied()
             .collect();
-        if watched.is_empty() { continue; }
+        if watched.is_empty() {
+            continue;
+        }
         watched_count += 1;
         let dev_name = dev.name().unwrap_or("?").to_owned();
         eprintln!(
@@ -66,19 +76,24 @@ pub fn spawn(control_dir: PathBuf) {
             watched.len(),
         );
         let cd = control_dir.clone();
+        let lt = Arc::clone(&last_toggle);
         let _ = std::thread::Builder::new()
             .name("hotkey-listener".into())
-            .spawn(move || run_listener(dev, watched, cd));
+            .spawn(move || run_listener(dev, watched, cd, lt));
     }
     if watched_count == 0 {
         eprintln!("hotkey: no input device exposes any of the configured chords");
     }
 }
 
-fn run_listener(mut dev: Device, chords: Vec<(KeyCode, KeyCode)>, control_dir: PathBuf) {
+fn run_listener(
+    mut dev: Device,
+    chords: Vec<(KeyCode, KeyCode)>,
+    control_dir: PathBuf,
+    last_toggle: Arc<Mutex<Instant>>,
+) {
     use std::collections::HashSet;
     let mut pressed: HashSet<KeyCode> = HashSet::new();
-    let mut last_toggle = Instant::now() - TOGGLE_COOLDOWN;
 
     loop {
         let events = match dev.fetch_events() {
@@ -91,19 +106,27 @@ fn run_listener(mut dev: Device, chords: Vec<(KeyCode, KeyCode)>, control_dir: P
         for ev in events {
             if let EventSummary::Key(_, key, value) = ev.destructure() {
                 match value {
-                    1 => { pressed.insert(key); }
-                    0 => { pressed.remove(&key); }
+                    1 => {
+                        pressed.insert(key);
+                    }
+                    0 => {
+                        pressed.remove(&key);
+                    }
                     _ => {} // 2 = autorepeat — keep state as-is.
                 }
             }
         }
 
         for (a, b) in &chords {
-            if pressed.contains(a) && pressed.contains(b)
-                && last_toggle.elapsed() >= TOGGLE_COOLDOWN
-            {
-                toggle_paused(&control_dir);
-                last_toggle = Instant::now();
+            if pressed.contains(a) && pressed.contains(b) {
+                let mut guard = match last_toggle.lock() {
+                    Ok(g) => g,
+                    Err(p) => p.into_inner(), // poisoned: another thread panicked, we still want to toggle
+                };
+                if guard.elapsed() >= TOGGLE_COOLDOWN {
+                    toggle_paused(&control_dir);
+                    *guard = Instant::now();
+                }
                 break;
             }
         }
