@@ -413,6 +413,21 @@ pub fn is_installed() -> bool {
     std::path::Path::new(SUDOERS_PATH).exists()
 }
 
+/// `true` iff `path` sits in a tree that's root-owned on every supported
+/// distro. Used to gate `pkexec` invocations: a user-writable tree means
+/// any local user can trojan the binary and ride the elevation.
+///
+/// Excludes `/usr/local/`: on Arch / SteamOS-derived distros it's often
+/// user-writable for ad-hoc installs, which would defeat the check.
+#[must_use]
+pub fn is_safe_install_source(path: &Path) -> bool {
+    if path == Path::new(INSTALL_BIN) {
+        return true;
+    }
+    const SAFE_PREFIXES: &[&str] = &["/usr/bin/", "/usr/sbin/", "/usr/lib/", "/usr/libexec/"];
+    SAFE_PREFIXES.iter().any(|p| path.starts_with(p))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

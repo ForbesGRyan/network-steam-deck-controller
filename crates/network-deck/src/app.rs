@@ -743,7 +743,7 @@ fn spawn_installer(self_exe: &std::path::Path) -> std::io::Result<Child> {
     // Pin self_exe to a system-owned path before elevating: pkexec runs the
     // target as root, so a user-writable path here is a one-step root.
     let canonical = self_exe.canonicalize().unwrap_or_else(|_| self_exe.to_path_buf());
-    if !is_safe_install_source(&canonical) {
+    if !crate::install::is_safe_install_source(&canonical) {
         return Err(std::io::Error::other(format!(
             "refusing to pkexec a binary outside the system tree: {}\n\
              re-run from {} or anywhere under /usr/.",
@@ -780,16 +780,6 @@ fn is_gamescope_session() -> bool {
         || env_contains("XDG_SESSION_DESKTOP", "gamescope")
 }
 
-/// `true` iff `path` is the canonical install location or anywhere under
-/// `/usr/`. These trees are root-owned on every supported distro, so the
-/// binary about to be elevated by `pkexec` can't have been swapped out by a
-/// non-root attacker.
-fn is_safe_install_source(path: &std::path::Path) -> bool {
-    if path == std::path::Path::new(crate::install::INSTALL_BIN) {
-        return true;
-    }
-    path.starts_with("/usr/")
-}
 
 #[derive(Debug, PartialEq, Eq)]
 struct View {

@@ -107,14 +107,13 @@ impl DaemonChild {
             }
             Escalation::Pkexec => {
                 // pkexec runs the target as root — refuse if `self_exe`
-                // sits in a user-writable tree (e.g. $HOME), otherwise
-                // any local user can trojan the binary and ride pkexec.
+                // sits in a user-writable tree (e.g. $HOME or /usr/local),
+                // otherwise any local user can trojan the binary and ride
+                // pkexec.
                 let canonical = self_exe
                     .canonicalize()
                     .unwrap_or_else(|_| self_exe.to_path_buf());
-                if canonical != Path::new(crate::install::INSTALL_BIN)
-                    && !canonical.starts_with("/usr/")
-                {
+                if !crate::install::is_safe_install_source(&canonical) {
                     return Err(std::io::Error::other(format!(
                         "refusing to pkexec a binary outside the system tree: {}",
                         canonical.display()
