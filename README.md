@@ -28,75 +28,32 @@ crates/client-win/     Windows tray app driving usbip.exe attach
 
 ## Install
 
-Grab the prebuilt binaries from
-[Releases](https://github.com/ForbesGRyan/network-steam-deck-controller/releases/latest)
-or build from source (see [Build from source](#build-from-source)).
+Grab the latest binaries from
+[Releases](https://github.com/ForbesGRyan/network-steam-deck-controller/releases/latest).
 
-### Steam Deck
-
-In **Desktop Mode**, open Konsole:
+**Steam Deck** — Desktop Mode → Konsole:
 
 ```sh
-# Download the latest release binary (or scp it over from your PC).
-curl -L -o network-deck \
-  https://github.com/ForbesGRyan/network-steam-deck-controller/releases/latest/download/network-deck-v0.1.0-x86_64-linux
-chmod +x network-deck
-sudo ./network-deck install
+curl -LO https://github.com/ForbesGRyan/network-steam-deck-controller/releases/latest/download/network-deck-v0.1.0-x86_64-linux
+chmod +x network-deck-v0.1.0-x86_64-linux
+sudo ./network-deck-v0.1.0-x86_64-linux install
 ```
 
-The installer is idempotent and:
+Then in Steam (still Desktop Mode), **Add a Non-Steam Game** → browse to
+`/var/lib/network-deck/network-deck`. Switch to Game Mode to launch it.
 
-- installs `usbip` userspace (briefly disables SteamOS readonly to
-  `pacman -S usbip` the first time),
-- loads `usbip-core` / `usbip-host` / `vhci-hcd` and persists them in
-  `/etc/modules-load.d/usbip.conf`,
-- enables `usbipd.service` (auto-starts at boot, listens on TCP 3240),
-- copies itself to `/var/lib/network-deck/network-deck` (root-owned),
-- writes `/etc/sudoers.d/network-deck` (NOPASSWD for the kiosk → daemon
-  hop only — the binary is root-owned so it can't be swapped out),
-- drops `~/.local/share/applications/network-deck-kiosk.desktop`.
+**Windows** — download `client-win-v0.1.0-x86_64-windows.exe`, drop it in
+`%LOCALAPPDATA%\NetworkDeck\`, and double-click. Accept the UAC + driver
+prompts to auto-install `usbip-win2` on first run.
 
-Then add the kiosk to Steam so it appears in Game Mode:
-
-1. Still in Desktop Mode, open Steam.
-2. Games → **Add a Non-Steam Game to My Library**.
-3. Browse to `/var/lib/network-deck/network-deck`, tick it, **Add Selected
-   Programs**.
-4. Switch back to Game Mode — **Network Deck** is in your library.
-
-### Windows
-
-Download `client-win-v0.1.0-x86_64-windows.exe` from the release page.
-Move it somewhere permanent **before** running (e.g.
-`%LOCALAPPDATA%\NetworkDeck\`) — autostart is registered with the path
-the binary launched from, so moving it later breaks autostart.
-
-Double-click to run. SmartScreen will warn (the binary isn't code-signed
-yet); click **More info** → **Run anyway**.
-
-First launch:
-
-1. If `usbip-win2` is missing, prompts to install. Accept the UAC prompt;
-   the Inno Setup wizard runs silently. Windows then shows a
-   driver-install dialog for the vhci kernel driver — accept that too.
-   (It sometimes opens behind the progress window — check the taskbar.)
-2. The pair heads-up appears next. Put the Deck in pair mode, then click
-   OK to start broadcasting.
-3. After successful pair, the tray app re-launches and starts the bridge.
-
-The tray icon lives in the system tray with menu entries **Connect**,
-**Disconnect**, **Pair new Deck...**, **Quit**.
+> Put the .exe in its final location *before* running — autostart records
+> whatever path it launched from.
 
 ## Pair
 
-First launch on each side handles it automatically. To re-pair later
-(swapped Deck, reset trust file, etc.):
-
-- Deck: open the kiosk → it shows the pair screen if there's no trust
-  file. Or run `sudo /var/lib/network-deck/network-deck pair`.
-- Windows: tray icon → **Pair new Deck...**.
-
-Both sides have 120 s. Confirm the fingerprints match before accepting.
+Launch both sides at once and confirm matching fingerprints within 120 s.
+First-run flow handles it automatically; re-pair via the kiosk's Setup
+screen or the tray's **Pair new Deck...** entry.
 
 ## Use
 
