@@ -33,6 +33,11 @@ impl RealRunner {
     /// rest of the codebase. Falls back to a bare `usbip` if absent so dev
     /// environments without a system install still work — logged so it's
     /// obvious why a later bind might fail.
+    ///
+    /// Linux-only because `crate::install` is gated to Linux (the rest of
+    /// the install logic depends on libc/sudoers semantics). Tests use the
+    /// `MockRunner` and don't need this constructor.
+    #[cfg(target_os = "linux")]
     #[must_use]
     pub fn new() -> Self {
         let usbip = crate::install::absolute_path_for("usbip").unwrap_or_else(|| {
@@ -63,12 +68,17 @@ impl CommandRunner for RealRunner {
 pub struct Connection {
     state: State,
     busid: String,
+    consecutive_bind_failures: u32,
 }
 
 impl Connection {
     #[must_use]
     pub fn new(busid: String) -> Self {
-        Self { state: State::Idle, busid }
+        Self {
+            state: State::Idle,
+            busid,
+            consecutive_bind_failures: 0,
+        }
     }
 
     #[must_use]
@@ -76,13 +86,25 @@ impl Connection {
         self.state
     }
 
+    /// How many bind attempts in a row have failed while a peer is present.
+    /// Resets on the first successful bind. The daemon surfaces this in the
+    /// status file once it crosses a small threshold so the kiosk can show
+    /// a real diagnostic instead of "Connecting…" forever.
+    #[must_use]
+    pub fn consecutive_bind_failures(&self) -> u32 {
+        self.consecutive_bind_failures
+    }
+
     pub fn tick(&mut self, peer_present: bool, runner: &mut dyn CommandRunner) -> Option<Action> {
         match (self.state, peer_present) {
             (State::Idle, true) => {
                 if runner.run_usbip(&["bind", "-b", &self.busid]) {
                     self.state = State::Bound;
+                    self.consecutive_bind_failures = 0;
                     Some(Action::Bind)
                 } else {
+                    self.consecutive_bind_failures =
+                        self.consecutive_bind_failures.saturating_add(1);
                     None
                 }
             }
@@ -156,6 +178,21 @@ mod tests {
         let mut runner = MockRunner { bind_succeeds: false, ..Default::default() };
         assert_eq!(conn.tick(true, &mut runner), None);
         assert_eq!(conn.state(), State::Idle);
+    }
+
+    #[test]
+    fn consecutive_bind_failures_count_and_reset() {
+        let mut conn = Connection::new("3-3".into());
+        let mut runner = MockRunner { bind_succeeds: false, ..Default::default() };
+        assert_eq!(conn.consecutive_bind_failures(), 0);
+        conn.tick(true, &mut runner);
+        conn.tick(true, &mut runner);
+        conn.tick(true, &mut runner);
+        assert_eq!(conn.consecutive_bind_failures(), 3);
+        // First success clears the counter.
+        runner.bind_succeeds = true;
+        assert_eq!(conn.tick(true, &mut runner), Some(Action::Bind));
+        assert_eq!(conn.consecutive_bind_failures(), 0);
     }
 
     #[test]

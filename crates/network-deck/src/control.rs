@@ -17,6 +17,11 @@ pub struct Status {
     pub peer_present: bool,
     pub bound: bool,
     pub paused: bool,
+    /// Set by the daemon when bind has failed repeatedly so the kiosk can
+    /// render a diagnostic. `serde(default)` + `skip_serializing_if` keeps
+    /// the JSON minimal and tolerates pre-field status.json snapshots.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bind_error: Option<String>,
 }
 
 #[must_use]
@@ -101,6 +106,7 @@ mod tests {
             peer_present: true,
             bound: true,
             paused: false,
+            bind_error: None,
         }
     }
 

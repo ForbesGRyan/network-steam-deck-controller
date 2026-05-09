@@ -249,6 +249,13 @@ impl KioskApp {
             ui.vertical_centered_justified(|ui| {
                 ui.add_space(40.0);
                 ui.heading(egui::RichText::new(&view.text).size(48.0));
+                if let Some(err) = &view.bind_error {
+                    ui.add_space(12.0);
+                    ui.colored_label(
+                        egui::Color32::LIGHT_RED,
+                        egui::RichText::new(err).size(18.0),
+                    );
+                }
                 ui.add_space(40.0);
                 let button = egui::Button::new(
                     egui::RichText::new(view.button_label).size(32.0),
@@ -789,34 +796,43 @@ struct View {
     text: String,
     button_label: &'static str,
     toggle_to: Option<bool>,
+    /// Forwarded from `Status::bind_error` so the kiosk can render it in
+    /// red beneath the heading. None when the daemon is healthy.
+    bind_error: Option<String>,
 }
 
 fn derive_view(status: Option<&Status>) -> View {
+    let bind_error = status.and_then(|s| s.bind_error.clone());
     match status {
         None => View {
             text: "Daemon not running".into(),
             button_label: "—",
             toggle_to: None,
+            bind_error,
         },
         Some(s) if s.paused => View {
             text: "Paused".into(),
             button_label: "Reconnect",
             toggle_to: Some(false),
+            bind_error,
         },
         Some(s) if !s.peer_present => View {
             text: "Searching for client…".into(),
             button_label: "Pause",
             toggle_to: Some(true),
+            bind_error,
         },
         Some(s) if !s.bound => View {
             text: format!("Connecting to {}…", peer_label(s)),
             button_label: "Pause",
             toggle_to: Some(true),
+            bind_error,
         },
         Some(s) => View {
             text: format!("Connected to {}", peer_label(s)),
             button_label: "Disconnect",
             toggle_to: Some(true),
+            bind_error,
         },
     }
 }
@@ -835,6 +851,7 @@ mod tests {
             peer_present,
             bound,
             paused,
+            bind_error: None,
         }
     }
 
@@ -874,6 +891,22 @@ mod tests {
         let without_name = status(None, true, false, false);
         let v = derive_view(Some(&without_name));
         assert_eq!(v.text, "Connecting to client…");
+    }
+
+    #[test]
+    fn bind_error_propagates_into_view() {
+        let mut s = status(Some("desktop"), true, false, false);
+        s.bind_error = Some("usbip bind failed 5 times".into());
+        let v = derive_view(Some(&s));
+        assert_eq!(v.text, "Connecting to desktop…");
+        assert_eq!(v.bind_error.as_deref(), Some("usbip bind failed 5 times"));
+    }
+
+    #[test]
+    fn no_bind_error_yields_none_in_view() {
+        let s = status(Some("desktop"), true, true, false);
+        let v = derive_view(Some(&s));
+        assert_eq!(v.bind_error, None);
     }
 
     #[test]

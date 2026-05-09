@@ -175,11 +175,23 @@ pub fn run(args: Args) {
                 }
             }
         }
+        // Threshold (3) keeps a single transient failure from spamming the
+        // kiosk; once we've retried this many times the user almost
+        // certainly needs to do something (load usbip-host, fix perms).
+        let bind_failures = conn.consecutive_bind_failures();
+        let bind_error = if bind_failures >= 3 {
+            Some(format!(
+                "usbip bind failed {bind_failures} times — is the usbip-host module loaded?"
+            ))
+        } else {
+            None
+        };
         let status = control::Status {
             peer_name: Some(trusted.name.clone()),
             peer_present: beacon_present,
             bound: matches!(conn.state(), State::Bound),
             paused,
+            bind_error,
         };
         // Skip the atomic-rename dance when nothing changed — saves eMMC
         // wear and the kiosk reader's no-op JSON parse on every tick.
