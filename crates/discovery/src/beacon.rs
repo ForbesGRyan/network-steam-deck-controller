@@ -273,4 +273,44 @@ mod tests {
         beacon.handle_packet("192.168.1.42:55555".parse().unwrap(), &buf);
         assert_eq!(beacon.current_peer(), None);
     }
+
+    #[test]
+    fn stranger_does_not_overwrite_active_peer() {
+        let me = make_identity();
+        let them = make_identity();
+        let stranger = make_identity();
+        let peer = make_peer(them.pubkey);
+        let dest = "127.0.0.1:1".parse().unwrap();
+        let beacon = Beacon::new(me, peer.clone(), vec![dest], "me".into(), 49152).unwrap();
+
+        // 1) Trusted peer establishes the live slot.
+        let trusted_pkt = BeaconPacket {
+            flags: 0,
+            pubkey: them.pubkey,
+            peer_fpr: fingerprint(&beacon.identity.pubkey),
+            timestamp_us: now_us(),
+            name: "them".into(),
+        };
+        let mut buf = [0_u8; PACKET_LEN];
+        packet::sign_into(&them.signing, &trusted_pkt, &mut buf).unwrap();
+        beacon.handle_packet("192.168.1.42:55555".parse().unwrap(), &buf);
+        let trusted_addr = beacon.current_peer().unwrap();
+        assert_eq!(trusted_addr.ip().to_string(), "192.168.1.42");
+
+        // 2) Stranger arrives from a different IP. Must be dropped; live slot
+        //    must still point at the trusted peer's IP.
+        let stranger_pkt = BeaconPacket {
+            flags: 0,
+            pubkey: stranger.pubkey,
+            peer_fpr: [0; FPR_LEN],
+            timestamp_us: now_us(),
+            name: "stranger".into(),
+        };
+        let mut sbuf = [0_u8; PACKET_LEN];
+        packet::sign_into(&stranger.signing, &stranger_pkt, &mut sbuf).unwrap();
+        beacon.handle_packet("10.0.0.99:55555".parse().unwrap(), &sbuf);
+
+        let after = beacon.current_peer().unwrap();
+        assert_eq!(after, trusted_addr, "stranger must not overwrite live peer");
+    }
 }
