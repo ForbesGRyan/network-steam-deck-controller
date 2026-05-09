@@ -212,6 +212,16 @@ impl eframe::App for KioskApp {
                 } else {
                     ui.add_enabled(false, button);
                 }
+                ui.add_space(24.0);
+                ui.label(
+                    egui::RichText::new(
+                        "Press Volume Up + Volume Down together to pause and\n\
+                         hand the controller back to the Deck.\n\
+                         The touchscreen keeps working while bridged.",
+                    )
+                    .size(16.0)
+                    .weak(),
+                );
             });
         });
 
