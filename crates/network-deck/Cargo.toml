@@ -1,6 +1,6 @@
 [package]
 name = "network-deck"
-version = "0.1.0"
+version = "0.1.1"
 edition.workspace = true
 license.workspace = true
 description = "Steam Deck side: single binary — kiosk UI, supervised daemon, pair flow, and first-run installer"

@@ -375,7 +375,7 @@ dependencies = [
 
 [[package]]
 name = "client-win"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "crossbeam-channel",
  "discovery",
@@ -607,7 +607,7 @@ dependencies = [
 
 [[package]]
 name = "discovery"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "base64",
  "ed25519-dalek",
@@ -1979,7 +1979,7 @@ dependencies = [
 
 [[package]]
 name = "network-deck"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "discovery",
  "eframe",
