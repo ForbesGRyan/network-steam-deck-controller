@@ -21,6 +21,107 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+/// Path-bearing install configuration. Lets the install/uninstall file-side
+/// run against any directory tree (real `/etc`, `/var/lib`, `~/.local/...`
+/// or a tempdir for tests). All paths are absolute.
+#[derive(Debug, Clone)]
+pub(super) struct InstallContext {
+    pub sudoers_path: PathBuf,
+    pub install_dir: PathBuf,
+    pub install_bin: PathBuf,
+    pub modules_load_path: PathBuf,
+    pub app_dir: PathBuf,
+    pub desktop_path: PathBuf,
+    /// Sudoers files from older releases that should be removed on install
+    /// or uninstall to keep the sudoers.d/ tree clean across upgrades.
+    pub legacy_sudoers_paths: Vec<PathBuf>,
+}
+
+impl InstallContext {
+    /// The production layout. Used by `run` and `uninstall`. Tests build
+    /// their own contexts pointed at a tempdir.
+    fn production(home: &Path) -> Self {
+        Self {
+            sudoers_path: PathBuf::from(SUDOERS_PATH),
+            install_dir: PathBuf::from(INSTALL_DIR),
+            install_bin: PathBuf::from(INSTALL_BIN),
+            modules_load_path: PathBuf::from(MODULES_LOAD_PATH),
+            app_dir: home.join(".local/share/applications"),
+            desktop_path: home
+                .join(".local/share/applications/network-deck-kiosk.desktop"),
+            legacy_sudoers_paths: LEGACY_SUDOERS_PATHS
+                .iter()
+                .map(PathBuf::from)
+                .collect(),
+        }
+    }
+}
+
+/// File-system side of `install`: writes sudoers, modules-load, .desktop;
+/// removes legacy sudoers paths. Idempotent — re-running on top of an
+/// existing layout overwrites in place. Does NOT chown/chmod, run visudo,
+/// invoke systemctl, or copy `argv[0]` — those are wrapped around this in
+/// `run`. Pure on the file system; testable against a tempdir.
+pub(super) fn install_files(ctx: &InstallContext) -> std::io::Result<()> {
+    if let Some(parent) = ctx.sudoers_path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::write(&ctx.sudoers_path, sudoers_body(&ctx.install_bin))?;
+
+    if let Some(parent) = ctx.modules_load_path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::write(&ctx.modules_load_path, MODULES_LOAD_BODY)?;
+
+    std::fs::create_dir_all(&ctx.install_dir)?;
+
+    std::fs::create_dir_all(&ctx.app_dir)?;
+    std::fs::write(&ctx.desktop_path, desktop_body(&ctx.install_bin))?;
+
+    for legacy in &ctx.legacy_sudoers_paths {
+        if legacy == &ctx.sudoers_path {
+            continue;
+        }
+        match std::fs::remove_file(legacy) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e),
+        }
+    }
+
+    Ok(())
+}
+
+/// File-system side of `uninstall`: removes sudoers, modules-load,
+/// install dir, .desktop, plus all legacy sudoers paths. Idempotent —
+/// missing files are not errors. Does NOT touch systemctl or remove the
+/// usbip package; production `uninstall` wraps this with those.
+pub(super) fn uninstall_files(ctx: &InstallContext) -> std::io::Result<()> {
+    let remove_file = |p: &Path| -> std::io::Result<()> {
+        match std::fs::remove_file(p) {
+            Ok(()) => Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(e),
+        }
+    };
+    let remove_dir_all = |p: &Path| -> std::io::Result<()> {
+        match std::fs::remove_dir_all(p) {
+            Ok(()) => Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(e),
+        }
+    };
+
+    remove_file(&ctx.sudoers_path)?;
+    remove_file(&ctx.modules_load_path)?;
+    remove_dir_all(&ctx.install_dir)?;
+    remove_file(&ctx.desktop_path)?;
+    for legacy in &ctx.legacy_sudoers_paths {
+        remove_file(legacy)?;
+    }
+    Ok(())
+}
+
 /// Sudoers file path. The `zz-` prefix forces this file to load AFTER
 /// `SteamOS`'s `/etc/sudoers.d/wheel` (`%wheel ALL=(ALL) ALL`, no NOPASSWD)
 /// in alphabetical scan order. Sudoers' last-match-wins evaluation means a
@@ -57,40 +158,44 @@ pub fn run() -> std::io::Result<()> {
         eprintln!("install: user {user:?} not found in passwd");
         std::process::exit(1);
     };
-    let install_dir = PathBuf::from(INSTALL_DIR);
-    let install_bin = PathBuf::from(INSTALL_BIN);
-    let app_dir = home.join(".local/share/applications");
-    let desktop_path = app_dir.join("network-deck-kiosk.desktop");
+    let ctx = InstallContext::production(&home);
 
     eprintln!(">> install user={user} home={}", home.display());
-    eprintln!(">> install dir={}", install_dir.display());
+    eprintln!(">> install dir={}", ctx.install_dir.display());
 
     ensure_usbip_userspace()?;
     load_kernel_modules()?;
-    persist_modules_load()?;
     enable_usbipd();
     disable_old_systemd_unit();
-    copy_self_to(&install_bin)?;
-    chown(&install_dir, "root", "root")?;
-    chmod(&install_dir, 0o755)?;
+    copy_self_to(&ctx.install_bin)?;
+    chown(&ctx.install_dir, "root", "root")?;
+    chmod(&ctx.install_dir, 0o755)?;
     // Plain 0o755. Setuid root was removed: paired with bare-name
     // Command::new() calls inside the daemon, it lets any local user
     // hijack PATH and execute as root. The sudoers NOPASSWD entry below
     // is the sole privilege-escalation path.
-    chmod(&install_bin, 0o755)?;
-    write_sudoers(&user, &install_bin)?;
-    remove_legacy_sudoers();
-    write_desktop(&user, &app_dir, &desktop_path, &install_bin)?;
+    chmod(&ctx.install_bin, 0o755)?;
+    // Write all files (sudoers, modules-load, .desktop, remove legacy sudoers).
+    // chmod/chown and visudo validation happen after for the sudoers file.
+    eprintln!(">> Writing {}", ctx.sudoers_path.display());
+    eprintln!(">> Writing {}", ctx.modules_load_path.display());
+    eprintln!(">> Writing {}", ctx.desktop_path.display());
+    install_files(&ctx)?;
+    // Secure the sudoers file and validate it after install_files writes it.
+    write_sudoers_post_files(&ctx.sudoers_path)?;
+    // chown the desktop entry and app dir to the user.
+    chown_warn(&ctx.app_dir, &user, &user);
+    chown_warn(&ctx.desktop_path, &user, &user);
 
     eprintln!();
     eprintln!("Done.");
     eprintln!();
     eprintln!("Next: pair with your Windows PC (run on each side at once):");
-    eprintln!("  {} pair", install_bin.display());
+    eprintln!("  {} pair", ctx.install_bin.display());
     eprintln!("  client-win.exe pair    # on Windows");
     eprintln!();
     eprintln!("Use:");
-    eprintln!("  Add {} to Steam as a non-Steam game", install_bin.display());
+    eprintln!("  Add {} to Steam as a non-Steam game", ctx.install_bin.display());
     eprintln!("  (one-time, in Desktop Mode). Tap from Game Mode to start;");
     eprintln!("  closing the window stops the daemon and unbinds the controller.");
     Ok(())
@@ -123,37 +228,18 @@ pub fn uninstall() -> std::io::Result<()> {
         eprintln!("warning: systemctl disable usbipd.service failed (already off?)");
     }
 
-    eprintln!(">> Removing {SUDOERS_PATH}");
-    if let Err(e) = std::fs::remove_file(SUDOERS_PATH) {
-        if e.kind() != std::io::ErrorKind::NotFound {
-            eprintln!("warning: remove {SUDOERS_PATH}: {e}");
-        }
-    }
+    // Build a context: if home lookup failed, use a placeholder that points
+    // nowhere real so uninstall_files still cleans the system paths.
+    let home_path = home.unwrap_or_else(|| PathBuf::from("/nonexistent"));
+    let ctx = InstallContext::production(&home_path);
 
-    remove_legacy_sudoers();
+    eprintln!(">> Removing {}", ctx.sudoers_path.display());
+    eprintln!(">> Removing {}", ctx.modules_load_path.display());
+    eprintln!(">> Removing {}", ctx.install_dir.display());
+    eprintln!(">> Removing {}", ctx.desktop_path.display());
 
-    eprintln!(">> Removing {MODULES_LOAD_PATH}");
-    if let Err(e) = std::fs::remove_file(MODULES_LOAD_PATH) {
-        if e.kind() != std::io::ErrorKind::NotFound {
-            eprintln!("warning: remove {MODULES_LOAD_PATH}: {e}");
-        }
-    }
-
-    eprintln!(">> Removing {INSTALL_DIR}");
-    if let Err(e) = std::fs::remove_dir_all(INSTALL_DIR) {
-        if e.kind() != std::io::ErrorKind::NotFound {
-            eprintln!("warning: remove {INSTALL_DIR}: {e}");
-        }
-    }
-
-    if let Some(home) = home {
-        let desktop = home.join(".local/share/applications/network-deck-kiosk.desktop");
-        eprintln!(">> Removing {}", desktop.display());
-        if let Err(e) = std::fs::remove_file(&desktop) {
-            if e.kind() != std::io::ErrorKind::NotFound {
-                eprintln!("warning: remove {}: {e}", desktop.display());
-            }
-        }
+    if let Err(e) = uninstall_files(&ctx) {
+        eprintln!("warning: uninstall_files: {e}");
     }
 
     eprintln!();
@@ -247,11 +333,6 @@ fn load_kernel_modules() -> std::io::Result<()> {
     Ok(())
 }
 
-fn persist_modules_load() -> std::io::Result<()> {
-    eprintln!(">> Writing {MODULES_LOAD_PATH}");
-    std::fs::write(MODULES_LOAD_PATH, MODULES_LOAD_BODY)
-}
-
 fn enable_usbipd() {
     eprintln!(">> Enabling usbipd.service...");
     if !run_ok("systemctl", &["enable", "--now", "usbipd.service"]) {
@@ -305,62 +386,36 @@ pub(super) fn sudoers_body(install_bin: &Path) -> String {
     )
 }
 
+/// chmod 0o440 + visudo validation step, run after `install_files` has
+/// already written the sudoers file. Keeps sudo-breaking partial states
+/// off disk: any failure removes the file before propagating.
+///
+/// The file-write itself is in `install_files` so it can be exercised in
+/// tempdir tests without needing root or visudo on the test host.
 #[allow(clippy::unnecessary_wraps)]
-fn write_sudoers(_user: &str, install_bin: &std::path::Path) -> std::io::Result<()> {
-    // User-agnostic rule. Original design keyed on `$SUDO_USER`, but on
-    // SteamOS:
-    //   - Game Mode under Family Share runs as the per-Steam-account user
-    //     (e.g. `496325425`), not whoever ran `sudo install` from Desktop.
-    //   - Steam can also launch the kiosk via wrappers that surface a
-    //     different effective uid than the install-time SUDO_USER.
-    // Restricting to a single user makes the kiosk silently break in those
-    // sessions ("sudo: a password is required" with no recovery path in
-    // Game Mode, since pkexec also can't prompt without a polkit agent).
-    //
-    // The grant is narrowly scoped — only `{INSTALL_BIN} daemon`. Pairing
-    // runs in-process as the user (pair_worker) and writes to
-    // `~/.local/state/network-deck/`, so it never needs sudo; granting it
-    // here was dead privilege and would also leave the trust file
-    // root-owned in the user's home if anyone did invoke `sudo … pair`.
-    // The binary path is root-owned (chmod 0755 set above) so a non-root
-    // user cannot swap it out to ride the rule.
-    let body = sudoers_body(install_bin);
-    // Wrap write + chmod + visudo so any failure removes the partial file
-    // before propagating. A broken file under /etc/sudoers.d/ makes sudo
-    // refuse to load any rules in the directory — users get "not in
-    // sudoers" with no recovery path. Wrong mode or invalid content both
-    // hit this; cleanup must cover both.
+fn write_sudoers_post_files(sudoers_path: &std::path::Path) -> std::io::Result<()> {
+    // Wrap chmod + visudo so any failure removes the partial file before
+    // propagating. A broken file under /etc/sudoers.d/ makes sudo refuse
+    // to load any rules in the directory — users get "not in sudoers"
+    // with no recovery path.
     let result = (|| -> std::io::Result<()> {
-        eprintln!(">> Writing {SUDOERS_PATH}");
-        std::fs::write(SUDOERS_PATH, body)?;
-        chmod(std::path::Path::new(SUDOERS_PATH), 0o440)?;
-        if !run_ok("visudo", &["-c", "-f", SUDOERS_PATH]) {
+        chmod(sudoers_path, 0o440)?;
+        let path_str = sudoers_path.display().to_string();
+        if !run_ok("visudo", &["-c", "-f", &path_str]) {
             return Err(std::io::Error::other(format!(
-                "visudo validation failed for {SUDOERS_PATH}"
+                "visudo validation failed for {}",
+                sudoers_path.display()
             )));
         }
         Ok(())
     })();
     if let Err(e) = result {
         eprintln!("{e}");
-        let _ = std::fs::remove_file(SUDOERS_PATH);
-        eprintln!("removed {SUDOERS_PATH} to keep sudo functional");
+        let _ = std::fs::remove_file(sudoers_path);
+        eprintln!("removed {} to keep sudo functional", sudoers_path.display());
         std::process::exit(1);
     }
     Ok(())
-}
-
-/// Remove sudoers files from older releases so an upgrade doesn't leave a
-/// stale, ineffectively-ordered rule on disk. Best-effort — missing files
-/// are not errors. Logged so a user can see what was cleaned.
-fn remove_legacy_sudoers() {
-    for path in LEGACY_SUDOERS_PATHS {
-        match std::fs::remove_file(path) {
-            Ok(()) => eprintln!(">> Removed legacy {path}"),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-            Err(e) => eprintln!("warning: remove legacy {path}: {e}"),
-        }
-    }
 }
 
 /// The contents of `network-deck-kiosk.desktop` as written by `install`.
@@ -380,21 +435,6 @@ pub(super) fn desktop_body(install_bin: &Path) -> String {
          Categories=Game;\n",
         bin = install_bin.display(),
     )
-}
-
-fn write_desktop(
-    user: &str,
-    app_dir: &std::path::Path,
-    desktop_path: &std::path::Path,
-    install_bin: &std::path::Path,
-) -> std::io::Result<()> {
-    std::fs::create_dir_all(app_dir)?;
-    let body = desktop_body(install_bin);
-    eprintln!(">> Writing {}", desktop_path.display());
-    std::fs::write(desktop_path, body)?;
-    chown_warn(app_dir, user, user);
-    chown_warn(desktop_path, user, user);
-    Ok(())
 }
 
 /// Hard-failing chown: returns Err on subprocess failure. Used for
@@ -654,6 +694,188 @@ mod tests {
         assert!(
             !LEGACY_SUDOERS_PATHS.contains(&SUDOERS_PATH),
             "SUDOERS_PATH {SUDOERS_PATH:?} must not also be in LEGACY_SUDOERS_PATHS",
+        );
+    }
+
+    // ── tempdir-based install/uninstall round-trip tests ─────────────────────
+
+    use std::path::PathBuf;
+    use tempfile::TempDir;
+
+    /// Build a self-contained tempdir-rooted `InstallContext` mimicking the
+    /// production layout. Caller holds the `TempDir` to keep it alive.
+    fn ctx_in(td: &TempDir) -> InstallContext {
+        let root = td.path();
+        InstallContext {
+            sudoers_path: root.join("etc/sudoers.d/zz-network-deck"),
+            install_dir: root.join("var/lib/network-deck"),
+            install_bin: root.join("var/lib/network-deck/network-deck"),
+            modules_load_path: root.join("etc/modules-load.d/usbip.conf"),
+            app_dir: root.join("home/deck/.local/share/applications"),
+            desktop_path: root
+                .join("home/deck/.local/share/applications/network-deck-kiosk.desktop"),
+            legacy_sudoers_paths: vec![root.join("etc/sudoers.d/network-deck")],
+        }
+    }
+
+    #[test]
+    fn install_files_writes_full_layout_into_tempdir() {
+        let td = tempfile::tempdir().unwrap();
+        let ctx = ctx_in(&td);
+        install_files(&ctx).unwrap();
+
+        let sudoers = std::fs::read_to_string(&ctx.sudoers_path).unwrap();
+        assert!(sudoers.contains("ALL ALL=(root) NOPASSWD:"));
+        assert!(sudoers.contains(ctx.install_bin.to_str().unwrap()));
+
+        let modules = std::fs::read_to_string(&ctx.modules_load_path).unwrap();
+        for m in ["usbip-core", "usbip-host", "vhci-hcd"] {
+            assert!(modules.contains(m), "missing {m} in: {modules}");
+        }
+
+        let desktop = std::fs::read_to_string(&ctx.desktop_path).unwrap();
+        assert!(desktop.starts_with("[Desktop Entry]\n"));
+        assert!(desktop.contains(&format!("Exec={}", ctx.install_bin.display())));
+
+        // install_dir created (but binary self-copy is NOT done by
+        // install_files — that's a `run` shellout).
+        assert!(ctx.install_dir.is_dir(), "install_dir not created");
+    }
+
+    #[test]
+    fn install_files_is_idempotent() {
+        let td = tempfile::tempdir().unwrap();
+        let ctx = ctx_in(&td);
+
+        install_files(&ctx).unwrap();
+        let sudoers_first = std::fs::read_to_string(&ctx.sudoers_path).unwrap();
+
+        install_files(&ctx).unwrap();
+        let sudoers_second = std::fs::read_to_string(&ctx.sudoers_path).unwrap();
+
+        assert_eq!(sudoers_first, sudoers_second, "re-run must be byte-identical");
+
+        // Only one sudoers file under etc/sudoers.d/ — idempotency must not
+        // create a duplicate at a different path.
+        let sudoers_dir = ctx.sudoers_path.parent().unwrap();
+        let entries: Vec<_> = std::fs::read_dir(sudoers_dir).unwrap().collect();
+        assert_eq!(entries.len(), 1, "expected exactly 1 sudoers file, got {entries:?}");
+    }
+
+    #[test]
+    fn install_files_removes_legacy_sudoers_path() {
+        let td = tempfile::tempdir().unwrap();
+        let ctx = ctx_in(&td);
+        let legacy = ctx.legacy_sudoers_paths[0].clone();
+
+        // Pre-create a stale legacy sudoers file.
+        std::fs::create_dir_all(legacy.parent().unwrap()).unwrap();
+        std::fs::write(&legacy, "stale content from older release\n").unwrap();
+        assert!(legacy.exists());
+
+        install_files(&ctx).unwrap();
+
+        assert!(!legacy.exists(), "install_files must remove legacy sudoers");
+        assert!(ctx.sudoers_path.exists(), "new sudoers must be present");
+    }
+
+    #[test]
+    fn install_files_legacy_removal_skips_when_legacy_equals_canonical() {
+        // Defense-in-depth: if a future maintainer accidentally lists the
+        // canonical path among legacies, install_files must NOT remove the
+        // file it just wrote. The skip is implemented; lock the behaviour
+        // against regression.
+        let td = tempfile::tempdir().unwrap();
+        let mut ctx = ctx_in(&td);
+        ctx.legacy_sudoers_paths.push(ctx.sudoers_path.clone());
+
+        install_files(&ctx).unwrap();
+        assert!(
+            ctx.sudoers_path.exists(),
+            "canonical sudoers path must survive even if listed as legacy",
+        );
+    }
+
+    #[test]
+    fn uninstall_files_removes_everything_install_wrote() {
+        let td = tempfile::tempdir().unwrap();
+        let ctx = ctx_in(&td);
+        install_files(&ctx).unwrap();
+        assert!(ctx.sudoers_path.exists());
+        assert!(ctx.modules_load_path.exists());
+        assert!(ctx.desktop_path.exists());
+        assert!(ctx.install_dir.is_dir());
+
+        uninstall_files(&ctx).unwrap();
+
+        assert!(!ctx.sudoers_path.exists(), "sudoers should be gone");
+        assert!(!ctx.modules_load_path.exists(), "modules-load should be gone");
+        assert!(!ctx.desktop_path.exists(), ".desktop should be gone");
+        assert!(!ctx.install_dir.exists(), "install_dir should be gone");
+    }
+
+    #[test]
+    fn uninstall_files_removes_legacy_sudoers_even_after_migration() {
+        let td = tempfile::tempdir().unwrap();
+        let ctx = ctx_in(&td);
+        let legacy = ctx.legacy_sudoers_paths[0].clone();
+
+        // Simulate a half-migrated state: legacy file exists, new one
+        // doesn't (someone manually nuked it). Uninstall must still clean
+        // the legacy.
+        std::fs::create_dir_all(legacy.parent().unwrap()).unwrap();
+        std::fs::write(&legacy, "stale\n").unwrap();
+        assert!(legacy.exists());
+
+        uninstall_files(&ctx).unwrap();
+        assert!(!legacy.exists(), "uninstall must remove legacy sudoers");
+    }
+
+    #[test]
+    fn install_uninstall_round_trip_leaves_no_files() {
+        let td = tempfile::tempdir().unwrap();
+        let ctx = ctx_in(&td);
+
+        install_files(&ctx).unwrap();
+        uninstall_files(&ctx).unwrap();
+
+        for p in [
+            &ctx.sudoers_path,
+            &ctx.modules_load_path,
+            &ctx.desktop_path,
+        ] {
+            assert!(!p.exists(), "{} should not exist", p.display());
+        }
+        assert!(!ctx.install_dir.exists());
+    }
+
+    #[test]
+    fn uninstall_files_is_idempotent_on_clean_tempdir() {
+        let td = tempfile::tempdir().unwrap();
+        let ctx = ctx_in(&td);
+        // No install — just call uninstall on a clean tempdir.
+        uninstall_files(&ctx).unwrap();
+        // And again — must still not error.
+        uninstall_files(&ctx).unwrap();
+    }
+
+    #[test]
+    fn production_context_uses_canonical_paths() {
+        let home = PathBuf::from("/home/deck");
+        let ctx = InstallContext::production(&home);
+        assert_eq!(ctx.sudoers_path, PathBuf::from(SUDOERS_PATH));
+        assert_eq!(ctx.install_dir, PathBuf::from(INSTALL_DIR));
+        assert_eq!(ctx.install_bin, PathBuf::from(INSTALL_BIN));
+        assert_eq!(ctx.modules_load_path, PathBuf::from(MODULES_LOAD_PATH));
+        assert_eq!(
+            ctx.desktop_path,
+            home.join(".local/share/applications/network-deck-kiosk.desktop"),
+        );
+        assert!(
+            ctx.legacy_sudoers_paths
+                .iter()
+                .any(|p| p == Path::new("/etc/sudoers.d/network-deck")),
+            "production context must include the v0 sudoers path for migration",
         );
     }
 }
