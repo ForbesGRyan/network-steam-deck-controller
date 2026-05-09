@@ -338,4 +338,42 @@ mod tests {
 
         assert_eq!(beacon.current_peer(), None, "stale-timestamp packet must be dropped");
     }
+
+    #[test]
+    fn peer_ip_change_updates_live_addr() {
+        let me = make_identity();
+        let them = make_identity();
+        let peer = make_peer(them.pubkey);
+        let dest = "127.0.0.1:1".parse().unwrap();
+        let beacon = Beacon::new(me, peer.clone(), vec![dest], "me".into(), 49152).unwrap();
+
+        // First beacon from 192.168.1.42.
+        let pkt = BeaconPacket {
+            flags: 0,
+            pubkey: them.pubkey,
+            peer_fpr: fingerprint(&beacon.identity.pubkey),
+            timestamp_us: now_us(),
+            name: "them".into(),
+        };
+        let mut buf = [0_u8; PACKET_LEN];
+        packet::sign_into(&them.signing, &pkt, &mut buf).unwrap();
+        beacon.handle_packet("192.168.1.42:55555".parse().unwrap(), &buf);
+        assert_eq!(beacon.current_peer().unwrap().ip().to_string(), "192.168.1.42");
+
+        // Same peer, fresh timestamp, new IP (DHCP renew).
+        let pkt2 = BeaconPacket {
+            flags: 0,
+            pubkey: them.pubkey,
+            peer_fpr: fingerprint(&beacon.identity.pubkey),
+            timestamp_us: now_us(),
+            name: "them".into(),
+        };
+        let mut buf2 = [0_u8; PACKET_LEN];
+        packet::sign_into(&them.signing, &pkt2, &mut buf2).unwrap();
+        beacon.handle_packet("192.168.1.99:55555".parse().unwrap(), &buf2);
+
+        let live = beacon.current_peer().unwrap();
+        assert_eq!(live.ip().to_string(), "192.168.1.99", "live IP must follow peer's new IP");
+        assert_eq!(live.port(), 49152, "port must stay normalized to listen port");
+    }
 }
