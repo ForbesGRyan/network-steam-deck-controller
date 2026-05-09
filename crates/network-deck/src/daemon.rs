@@ -72,6 +72,10 @@ pub fn run(args: Args) {
         eprintln!("bind 0.0.0.0:{BEACON_PORT}: {e}");
         std::process::exit(1);
     });
+    // Read timeout so a persistent recv error (interface gone, socket
+    // killed) wakes up regularly instead of busy-looping. Also lets the
+    // recv thread observe `term` and exit cleanly on shutdown.
+    let _ = bound.set_read_timeout(Some(Duration::from_millis(500)));
 
     let beacon = Arc::new(
         discovery::Beacon::new(
@@ -88,16 +92,38 @@ pub fn run(args: Args) {
     );
     discovery::beacon::spawn_broadcast(beacon.clone());
 
+    let term = Arc::new(AtomicBool::new(false));
+    for sig in [
+        signal_hook::consts::SIGTERM,
+        signal_hook::consts::SIGINT,
+        signal_hook::consts::SIGHUP,
+    ] {
+        let _ = signal_hook::flag::register(sig, term.clone());
+    }
+
     // Beacon recv thread: drains incoming beacons so live-peer state updates.
+    // Read timeout (set above) periodically wakes the loop so it can observe
+    // `term` and exit cleanly. WouldBlock / TimedOut on Linux is just the
+    // timeout firing — not an error to log.
     let beacon_recv = beacon.clone();
+    let term_recv = term.clone();
     std::thread::Builder::new()
         .name("discovery-recv".into())
         .spawn(move || {
             let mut buf = [0_u8; discovery::packet::PACKET_LEN];
-            loop {
-                if let Ok((n, src)) = bound.recv_from(&mut buf) {
-                    if n >= 4 && buf[0..4] == discovery::BEACON_MAGIC {
-                        beacon_recv.handle_packet(src, &buf[..n]);
+            while !term_recv.load(Ordering::Relaxed) {
+                match bound.recv_from(&mut buf) {
+                    Ok((n, src)) => {
+                        if n >= 4 && buf[0..4] == discovery::BEACON_MAGIC {
+                            beacon_recv.handle_packet(src, &buf[..n]);
+                        }
+                    }
+                    Err(e)
+                        if e.kind() == std::io::ErrorKind::WouldBlock
+                            || e.kind() == std::io::ErrorKind::TimedOut => {}
+                    Err(e) => {
+                        eprintln!("discovery-recv: {e}; sleeping 1s");
+                        std::thread::sleep(Duration::from_secs(1));
                     }
                 }
             }
@@ -129,15 +155,6 @@ pub fn run(args: Args) {
     // Tracks the firewall rule lifetime; populated on Action::Bind, dropped
     // on Action::Unbind or when the daemon exits.
     let mut peer_lock: Option<PeerLock> = None;
-
-    let term = Arc::new(AtomicBool::new(false));
-    for sig in [
-        signal_hook::consts::SIGTERM,
-        signal_hook::consts::SIGINT,
-        signal_hook::consts::SIGHUP,
-    ] {
-        let _ = signal_hook::flag::register(sig, term.clone());
-    }
 
     eprintln!("entering tick loop (interval = {} ms)", TICK_INTERVAL.as_millis());
     let mut last_status: Option<control::Status> = None;
