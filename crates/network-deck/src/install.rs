@@ -21,7 +21,20 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-const SUDOERS_PATH: &str = "/etc/sudoers.d/network-deck";
+/// Sudoers file path. The `zz-` prefix forces this file to load AFTER
+/// `SteamOS`'s `/etc/sudoers.d/wheel` (`%wheel ALL=(ALL) ALL`, no NOPASSWD)
+/// in alphabetical scan order. Sudoers' last-match-wins evaluation means a
+/// filename earlier than `wheel` gets overridden by the wheel rule, and our
+/// NOPASSWD line stops working — surfaced as `sudo: a password is required`
+/// when the kiosk tries to spawn the daemon. `SteamOS`'s own
+/// `wheel-prepare-oobe-test` uses the same trick.
+const SUDOERS_PATH: &str = "/etc/sudoers.d/zz-network-deck";
+
+/// Sudoers paths from older releases that we should remove on install or
+/// uninstall, so a user upgrading doesn't end up with a stale rule that
+/// hits the same ordering bug. Leave entries here forever; they're cheap.
+const LEGACY_SUDOERS_PATHS: &[&str] = &["/etc/sudoers.d/network-deck"];
+
 const MODULES_LOAD_PATH: &str = "/etc/modules-load.d/usbip.conf";
 const MODULES_LOAD_BODY: &str = "usbip-core\nusbip-host\nvhci-hcd\n";
 /// Where the daemon binary is installed. Root-owned so the deck user can't
@@ -66,6 +79,7 @@ pub fn run() -> std::io::Result<()> {
     // is the sole privilege-escalation path.
     chmod(&install_bin, 0o755)?;
     write_sudoers(&user, &install_bin)?;
+    remove_legacy_sudoers();
     write_desktop(&user, &app_dir, &desktop_path, &install_bin)?;
 
     eprintln!();
@@ -115,6 +129,8 @@ pub fn uninstall() -> std::io::Result<()> {
             eprintln!("warning: remove {SUDOERS_PATH}: {e}");
         }
     }
+
+    remove_legacy_sudoers();
 
     eprintln!(">> Removing {MODULES_LOAD_PATH}");
     if let Err(e) = std::fs::remove_file(MODULES_LOAD_PATH) {
@@ -332,6 +348,19 @@ fn write_sudoers(_user: &str, install_bin: &std::path::Path) -> std::io::Result<
         std::process::exit(1);
     }
     Ok(())
+}
+
+/// Remove sudoers files from older releases so an upgrade doesn't leave a
+/// stale, ineffectively-ordered rule on disk. Best-effort — missing files
+/// are not errors. Logged so a user can see what was cleaned.
+fn remove_legacy_sudoers() {
+    for path in LEGACY_SUDOERS_PATHS {
+        match std::fs::remove_file(path) {
+            Ok(()) => eprintln!(">> Removed legacy {path}"),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => eprintln!("warning: remove legacy {path}: {e}"),
+        }
+    }
 }
 
 /// The contents of `network-deck-kiosk.desktop` as written by `install`.
@@ -587,5 +616,44 @@ mod tests {
         // No command on PATH should plausibly be named like this; verifies
         // the lookup loop terminates with None on every supported host.
         assert!(absolute_path_for("definitely-not-a-real-binary-xyzzy123").is_none());
+    }
+
+    #[test]
+    fn sudoers_path_sorts_after_wheel_files_on_steamos() {
+        // SteamOS ships /etc/sudoers.d/wheel with `%wheel ALL=(ALL) ALL`
+        // (no NOPASSWD). Sudoers' last-match-wins eval means our NOPASSWD
+        // line is only effective if our file loads ALPHABETICALLY AFTER
+        // every `wheel*` file. Pin the prefix so a refactor can't drop us
+        // back into the override zone.
+        let leaf = Path::new(SUDOERS_PATH).file_name().unwrap().to_str().unwrap();
+        assert!(leaf > "wheel-zzz", "got {leaf:?} — must sort after wheel*");
+        // Plus a hard string check so we don't drift to e.g. `zz_network-deck`
+        // (underscore < dash, would still sort after `wheel-*` but is a
+        // surprise waiting to bite if we ever change wheel-prepare-oobe-test
+        // patterns).
+        assert_eq!(SUDOERS_PATH, "/etc/sudoers.d/zz-network-deck");
+    }
+
+    #[test]
+    fn legacy_sudoers_paths_includes_original_v0_filename() {
+        // Anyone upgrading from a release before this rename has a stale
+        // /etc/sudoers.d/network-deck file. Install + uninstall both clean
+        // it via remove_legacy_sudoers; pin the entry so a careless edit
+        // can't drop migrations on the floor.
+        assert!(
+            LEGACY_SUDOERS_PATHS.contains(&"/etc/sudoers.d/network-deck"),
+            "got {LEGACY_SUDOERS_PATHS:?} — must include the v0 filename",
+        );
+    }
+
+    #[test]
+    fn sudoers_path_is_not_the_legacy_path() {
+        // Sanity: the install destination and the legacy migration list
+        // must not overlap, or install would write+then-remove its own
+        // file. Cheap regression guard.
+        assert!(
+            !LEGACY_SUDOERS_PATHS.contains(&SUDOERS_PATH),
+            "SUDOERS_PATH {SUDOERS_PATH:?} must not also be in LEGACY_SUDOERS_PATHS",
+        );
     }
 }
