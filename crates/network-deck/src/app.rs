@@ -870,13 +870,16 @@ fn derive_view(status: Option<&Status>) -> View {
             bind_error,
         },
         Some(s) if !s.bound => View {
-            text: format!("Connecting to {}…", peer_label(s)),
+            text: format!("Preparing for {}…", peer_label(s)),
             button_label: "Pause",
             toggle_to: Some(true),
             bind_error,
         },
+        // `bound` only means the Deck handed the controller to usbip-host;
+        // it doesn't confirm the PC has attached over TCP. "Ready for" is
+        // accurate; user knows the Deck side is set up.
         Some(s) => View {
-            text: format!("Connected to {}", peer_label(s)),
+            text: format!("Ready for {}", peer_label(s)),
             button_label: "Disconnect",
             toggle_to: Some(true),
             bind_error,
@@ -928,16 +931,16 @@ mod tests {
     }
 
     #[test]
-    fn peer_unbound_renders_connecting_with_name_or_fallback() {
+    fn peer_unbound_renders_preparing_with_name_or_fallback() {
         let with_name = status(Some("desktop"), true, false, false);
         let v = derive_view(Some(&with_name));
-        assert_eq!(v.text, "Connecting to desktop…");
+        assert_eq!(v.text, "Preparing for desktop…");
         assert_eq!(v.button_label, "Pause");
         assert_eq!(v.toggle_to, Some(true));
 
         let without_name = status(None, true, false, false);
         let v = derive_view(Some(&without_name));
-        assert_eq!(v.text, "Connecting to client…");
+        assert_eq!(v.text, "Preparing for client…");
     }
 
     #[test]
@@ -945,7 +948,7 @@ mod tests {
         let mut s = status(Some("desktop"), true, false, false);
         s.bind_error = Some("usbip bind failed 5 times".into());
         let v = derive_view(Some(&s));
-        assert_eq!(v.text, "Connecting to desktop…");
+        assert_eq!(v.text, "Preparing for desktop…");
         assert_eq!(v.bind_error.as_deref(), Some("usbip bind failed 5 times"));
     }
 
@@ -957,15 +960,15 @@ mod tests {
     }
 
     #[test]
-    fn peer_bound_renders_connected_targeting_pause() {
+    fn peer_bound_renders_ready_targeting_pause() {
         let with_name = status(Some("desktop"), true, true, false);
         let v = derive_view(Some(&with_name));
-        assert_eq!(v.text, "Connected to desktop");
+        assert_eq!(v.text, "Ready for desktop");
         assert_eq!(v.button_label, "Disconnect");
         assert_eq!(v.toggle_to, Some(true));
 
         let without_name = status(None, true, true, false);
         let v = derive_view(Some(&without_name));
-        assert_eq!(v.text, "Connected to client");
+        assert_eq!(v.text, "Ready for client");
     }
 }
