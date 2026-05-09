@@ -1,65 +1,59 @@
-//! Reusable egui-based dialogs for the Windows tray app. Same framework
-//! the Deck kiosk uses, so dialogs match visually.
+//! Dialogs for the Windows tray app.
 //!
-//! Each entry point spins up a top-level eframe window on the calling
-//! thread. `with_progress` additionally runs a worker thread for the
-//! actual work and ticks the dialog until the worker is done.
+//! `info`, `error`, and `confirm` use native Win32 `MessageBoxW`. They're
+//! used in sequence during the install + first-run-pair flow, and
+//! `eframe::run_native` (winit) panics if a second event loop is created in
+//! the same process — so anything called more than once must be native.
+//!
+//! `with_progress` is the only egui dialog. It's only ever invoked once per
+//! process (during the usbip-win2 install), so a single `run_native` call
+//! is safe. It runs a worker thread and ticks a spinner until the work
+//! finishes; we keep egui here because `MessageBoxW` can't show a spinner.
 
+use std::ptr;
 use std::sync::mpsc;
-use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
 use eframe::egui;
+use windows_sys::Win32::UI::WindowsAndMessaging::{
+    MessageBoxW, IDYES, MB_ICONERROR, MB_ICONQUESTION, MB_OK, MB_SETFOREGROUND, MB_TOPMOST,
+    MB_YESNO,
+};
 
-const CONFIRM_SIZE: [f32; 2] = [480.0, 240.0];
+use crate::util::wide;
+
 const PROGRESS_SIZE: [f32; 2] = [480.0, 200.0];
 
-/// Yes/No dialog with custom button labels. Closing the window via the X
+/// Yes/No dialog. The `accept`/`decline` strings are appended to the body
+/// (Win32 `MessageBoxW` doesn't support custom button labels, so the text
+/// has to spell out which button to click). Closing the window via the X
 /// button counts as `decline`. Blocks until the user dismisses it.
 pub fn confirm(title: &str, body: &str, accept: &str, decline: &str) -> bool {
-    let result = Arc::new(Mutex::new(false));
-    let result2 = Arc::clone(&result);
-    let body = body.to_owned();
-    let accept = accept.to_owned();
-    let decline = decline.to_owned();
-
-    let opts = window_options(CONFIRM_SIZE);
-    eframe::run_native(
-        title,
-        opts,
-        Box::new(move |_cc| {
-            Ok(Box::new(ConfirmApp { body, accept, decline, result: result2 })
-                as Box<dyn eframe::App>)
-        }),
-    )
-    .expect("eframe::run_native(confirm)");
-
-    let r = *result.lock().expect("confirm result mutex");
-    r
+    let body = format!("{body}\n\nYes = {accept}    No = {decline}");
+    message_box(title, &body, MB_YESNO | MB_ICONQUESTION) == IDYES
 }
 
-/// Single-button informational dialog.
-pub fn info(title: &str, body: &str) {
-    show_oneshot(title, body, false);
-}
-
-/// Single-button error dialog (red body text).
+/// Single-button error dialog.
 pub fn error(title: &str, body: &str) {
-    show_oneshot(title, body, true);
+    message_box(title, body, MB_OK | MB_ICONERROR);
 }
 
-fn show_oneshot(title: &str, body: &str, is_error: bool) {
-    let body = body.to_owned();
-    let opts = window_options(CONFIRM_SIZE);
-    eframe::run_native(
-        title,
-        opts,
-        Box::new(move |_cc| {
-            Ok(Box::new(OneShotApp { body, is_error }) as Box<dyn eframe::App>)
-        }),
-    )
-    .expect("eframe::run_native(oneshot)");
+fn message_box(title: &str, body: &str, style: u32) -> i32 {
+    let title_w = wide(title);
+    let body_w = wide(body);
+    // SAFETY: both buffers are NUL-terminated UTF-16 from `wide`. Passing
+    // null hWnd shows an unowned top-level dialog. MB_TOPMOST | MB_SETFOREGROUND
+    // brings it above whatever has focus (the tray app has no visible window
+    // for it to anchor to).
+    unsafe {
+        MessageBoxW(
+            ptr::null_mut(),
+            body_w.as_ptr(),
+            title_w.as_ptr(),
+            style | MB_TOPMOST | MB_SETFOREGROUND,
+        )
+    }
 }
 
 /// Run `work` on a worker thread while showing a spinner + status line.
@@ -85,7 +79,13 @@ where
         .expect("spawn install-worker");
 
     let initial = initial_status.to_owned();
-    let opts = window_options(PROGRESS_SIZE);
+    let opts = eframe::NativeOptions {
+        viewport: egui::ViewportBuilder::default()
+            .with_inner_size(PROGRESS_SIZE)
+            .with_min_inner_size(PROGRESS_SIZE)
+            .with_resizable(false),
+        ..Default::default()
+    };
     eframe::run_native(
         title,
         opts,
@@ -112,82 +112,6 @@ impl ProgressHandle {
 enum ProgressMsg {
     SetStatus(String),
     Close,
-}
-
-fn window_options(size: [f32; 2]) -> eframe::NativeOptions {
-    eframe::NativeOptions {
-        viewport: egui::ViewportBuilder::default()
-            .with_inner_size(size)
-            .with_min_inner_size(size)
-            .with_resizable(false),
-        ..Default::default()
-    }
-}
-
-struct ConfirmApp {
-    body: String,
-    accept: String,
-    decline: String,
-    result: Arc<Mutex<bool>>,
-}
-
-impl eframe::App for ConfirmApp {
-    fn update(&mut self, ctx: &egui::Context, _: &mut eframe::Frame) {
-        egui::CentralPanel::default().show(ctx, |ui| {
-            ui.add_space(20.0);
-            ui.label(egui::RichText::new(&self.body).size(16.0));
-            ui.add_space(20.0);
-            // right_to_left lays items right→left in the order added, so add
-            // `decline` first (rightmost) and `accept` second (left of it).
-            // Pair confirmation puts accept on the left so an accidental
-            // muscle-memory tap on the right edge (where Windows usually
-            // puts OK / primary) doesn't auto-trust an unknown Deck.
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                let decline = egui::Button::new(egui::RichText::new(&self.decline).size(16.0))
-                    .min_size(egui::vec2(120.0, 36.0));
-                if ui.add(decline).clicked() {
-                    *self.result.lock().expect("confirm result mutex") = false;
-                    ctx.send_viewport_cmd(egui::ViewportCommand::Close);
-                }
-                ui.add_space(8.0);
-                let accept = egui::Button::new(egui::RichText::new(&self.accept).size(16.0))
-                    .min_size(egui::vec2(120.0, 36.0));
-                if ui.add(accept).clicked() {
-                    *self.result.lock().expect("confirm result mutex") = true;
-                    ctx.send_viewport_cmd(egui::ViewportCommand::Close);
-                }
-            });
-        });
-    }
-}
-
-struct OneShotApp {
-    body: String,
-    is_error: bool,
-}
-
-impl eframe::App for OneShotApp {
-    fn update(&mut self, ctx: &egui::Context, _: &mut eframe::Frame) {
-        egui::CentralPanel::default().show(ctx, |ui| {
-            ui.add_space(20.0);
-            if self.is_error {
-                ui.colored_label(
-                    egui::Color32::LIGHT_RED,
-                    egui::RichText::new(&self.body).size(16.0),
-                );
-            } else {
-                ui.label(egui::RichText::new(&self.body).size(16.0));
-            }
-            ui.add_space(20.0);
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                let ok = egui::Button::new(egui::RichText::new("OK").size(16.0))
-                    .min_size(egui::vec2(120.0, 36.0));
-                if ui.add(ok).clicked() {
-                    ctx.send_viewport_cmd(egui::ViewportCommand::Close);
-                }
-            });
-        });
-    }
 }
 
 struct ProgressApp {

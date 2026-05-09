@@ -303,6 +303,7 @@ fn run_attach_loop(
                         Arc::clone(identity),
                         hostname(),
                         state_dir,
+                        false,
                     );
                     match outcome {
                         discovery::pair::PairOutcome::Paired(_) => {
@@ -392,28 +393,20 @@ fn run_attach_loop(
     }
 }
 
-/// First-run pair. Binds 49152, hands the socket to `pair_dialog`, and on
-/// success re-execs ourselves so the freshly-written trust file is picked
-/// up cleanly on the next launch. Always diverges.
+/// First-run pair. Binds 49152, hands the socket to `pair_dialog` with the
+/// intro state enabled (so the user gets a "Start pairing" button before
+/// we start broadcasting), and on success re-execs ourselves so the
+/// freshly-written trust file is picked up cleanly on the next launch.
+/// Always diverges.
 #[cfg(windows)]
 fn first_run_pair(identity: Arc<discovery::Identity>, state_dir: &std::path::Path) -> ! {
-    // Heads-up so the user can put the Deck in pair mode before we start
-    // broadcasting. The pair flow has its own 120 s timeout once we
-    // proceed; this dialog is the chance to back out by closing it.
-    dialogs::info(
-        "Network Deck — first-time pair",
-        "No paired Deck found.\n\n\
-         On the Deck, launch Network Deck and tap \"Start pairing\".\n\
-         Click OK to start pairing on this PC.",
-    );
-
     let bind_addr = SocketAddr::new(Ipv4Addr::UNSPECIFIED.into(), DEFAULT_PORT);
     let sock = UdpSocket::bind(bind_addr).unwrap_or_else(|e| {
         eprintln!("bind {bind_addr}: {e}");
         std::process::exit(1);
     });
 
-    let outcome = pair_dialog::run(sock, identity, hostname(), state_dir);
+    let outcome = pair_dialog::run(sock, identity, hostname(), state_dir, true);
     match outcome {
         discovery::pair::PairOutcome::Paired(_) => util::reexec_self(),
         other => {

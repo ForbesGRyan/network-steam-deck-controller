@@ -18,14 +18,19 @@ use windows_sys::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
 
 use crate::dialogs;
 use crate::usbip_cli;
-use crate::util::wide;
+use crate::util::{reexec_self, wide};
 
 const RELEASE_URL: &str =
     "https://github.com/vadimgrn/usbip-win2/releases/download/v.0.9.7.7/USBip-0.9.7.7-x64.exe";
 
 /// If `usbip.exe` is missing, prompt the user and auto-install. Exits the
 /// process on declined or failed installs so the caller can assume usbip is
-/// available on return.
+/// available on return. On a successful install we re-exec instead of
+/// returning: `with_progress` already created an `eframe::run_native`
+/// event loop in this process, and winit panics if a second one is created
+/// (e.g. by the pair dialog later in the same launch). The fresh process
+/// starts clean and skips `run_install_flow` because `locate()` now finds
+/// usbip.exe.
 pub fn ensure_installed_or_exit() {
     if usbip_cli::locate().is_ok() {
         return;
@@ -33,6 +38,7 @@ pub fn ensure_installed_or_exit() {
     if !run_install_flow() {
         std::process::exit(1);
     }
+    reexec_self();
 }
 
 fn run_install_flow() -> bool {

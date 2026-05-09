@@ -59,6 +59,9 @@ pub enum PairOutcome {
     Paired(TrustedPeer),
     Declined,
     Timeout,
+    /// UI signalled cancel (window closed, Cancel button). The flow stopped
+    /// at the next tick after `PairUI::cancelled` returned true.
+    Cancelled,
     IoError(io::Error),
 }
 
@@ -92,6 +95,10 @@ pub trait PairUI {
     }
     fn on_paired(&mut self, _peer: &TrustedPeer) {}
     fn on_failed(&mut self, _reason: &str) {}
+    /// Polled between recv ticks. Returning `true` stops the flow with
+    /// `PairOutcome::Cancelled`. Default never cancels — the CLI driver
+    /// has nothing to signal it.
+    fn cancelled(&mut self) -> bool { false }
 }
 
 
@@ -147,7 +154,10 @@ pub fn run_pair_with<U: PairUI>(cfg: &PairConfig, ui: &mut U) -> PairOutcome {
     // Phase 1+2: collect distinct PAIRING peers for a short window, then
     // ask the caller to pick one. Repeat if they decline the whole batch.
     let candidate = loop {
-        match collect_candidates(cfg, &mut buf, &declined, deadline) {
+        if ui.cancelled() {
+            return PairOutcome::Cancelled;
+        }
+        match collect_candidates(cfg, &mut buf, &declined, deadline, ui) {
             CollectOutcome::Candidates(found) => match ui.prompt_candidates(&found) {
                 Some(c) => break c,
                 None => {
@@ -159,6 +169,9 @@ pub fn run_pair_with<U: PairUI>(cfg: &PairConfig, ui: &mut U) -> PairOutcome {
             CollectOutcome::Timeout => {
                 ui.on_failed("timeout waiting for peer");
                 return PairOutcome::Timeout;
+            }
+            CollectOutcome::Cancelled => {
+                return PairOutcome::Cancelled;
             }
             CollectOutcome::IoError(e) => {
                 ui.on_failed(&format!("recv error: {e}"));
@@ -176,6 +189,9 @@ pub fn run_pair_with<U: PairUI>(cfg: &PairConfig, ui: &mut U) -> PairOutcome {
     send_state.flags.store(FLAG_ACCEPT, Ordering::Relaxed);
 
     loop {
+        if ui.cancelled() {
+            return PairOutcome::Cancelled;
+        }
         if Instant::now() >= deadline {
             ui.on_failed("timeout during accept exchange");
             return PairOutcome::Timeout;
@@ -220,6 +236,7 @@ pub fn run_pair_with<U: PairUI>(cfg: &PairConfig, ui: &mut U) -> PairOutcome {
 enum CollectOutcome {
     Candidates(Vec<PairCandidate>),
     Timeout,
+    Cancelled,
     IoError(io::Error),
 }
 
@@ -227,17 +244,21 @@ enum CollectOutcome {
 /// once the first one shows up. Returns as soon as the window elapses with
 /// at least one candidate that hasn't been previously declined, or on the
 /// outer pair-flow deadline.
-fn collect_candidates(
+fn collect_candidates<U: PairUI>(
     cfg: &PairConfig,
     buf: &mut [u8; PACKET_LEN],
     declined: &HashSet<[u8; PUBKEY_LEN]>,
     deadline: Instant,
+    ui: &mut U,
 ) -> CollectOutcome {
     let mut seen: HashSet<[u8; PUBKEY_LEN]> = HashSet::new();
     let mut candidates: Vec<PairCandidate> = Vec::new();
     let mut window_close: Option<Instant> = None;
 
     loop {
+        if ui.cancelled() {
+            return CollectOutcome::Cancelled;
+        }
         let now = Instant::now();
         if now >= deadline {
             return CollectOutcome::Timeout;
