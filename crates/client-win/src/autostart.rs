@@ -27,7 +27,6 @@ pub fn enable() -> Result<(), u32> {
 ///
 /// # Errors
 /// Returns the Win32 error code on failure (`ERROR_FILE_NOT_FOUND` is treated as success).
-#[allow(dead_code)] // public API; tray "disable autostart" toggle not wired yet
 pub fn disable() -> Result<(), u32> {
     let subkey = wide(SUBKEY);
     let value = wide(VALUE_NAME);

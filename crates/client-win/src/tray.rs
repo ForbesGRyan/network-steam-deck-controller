@@ -14,7 +14,7 @@
 //! entirely on its own thread.
 
 use crossbeam_channel::{unbounded, Receiver, Sender};
-use tray_icon::menu::{Menu, MenuEvent, MenuItem};
+use tray_icon::menu::{CheckMenuItem, Menu, MenuEvent, MenuItem};
 use tray_icon::{Icon, TrayIconBuilder};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -22,6 +22,8 @@ pub enum TrayEvent {
     Connect,
     Disconnect,
     Pair,
+    /// User toggled the "Start at login" check item; payload is the new desired state.
+    ToggleAutostart(bool),
     Quit,
 }
 
@@ -43,36 +45,45 @@ impl TrayHandle {
 /// Spawn the tray on its own thread. Returns the receiver of menu events
 /// and a handle for tooltip updates.
 ///
+/// `autostart_enabled` is the initial check state of the "Start at login"
+/// item; the caller reads it from the registry before calling.
+///
 /// # Panics
 /// Never in practice; if icon construction fails we eprintln + return a
 /// noop handle so the rest of the app keeps running.
 #[must_use]
-pub fn spawn() -> (Receiver<TrayEvent>, TrayHandle) {
+pub fn spawn(autostart_enabled: bool) -> (Receiver<TrayEvent>, TrayHandle) {
     let (tx, rx) = unbounded::<TrayEvent>();
     let (tooltip_tx, tooltip_rx) = unbounded::<String>();
 
     std::thread::Builder::new()
         .name("tray".into())
         .spawn(move || {
-            run_tray_thread(&tx, &tooltip_rx);
+            run_tray_thread(&tx, &tooltip_rx, autostart_enabled);
         })
         .ok();
 
     (rx, TrayHandle { tooltip_tx })
 }
 
-fn run_tray_thread(tx: &Sender<TrayEvent>, tooltip_rx: &Receiver<String>) {
+fn run_tray_thread(
+    tx: &Sender<TrayEvent>,
+    tooltip_rx: &Receiver<String>,
+    autostart_enabled: bool,
+) {
     let menu = Menu::new();
     let connect = MenuItem::new("Connect", true, None);
     let disconnect = MenuItem::new("Disconnect", true, None);
     let pair = MenuItem::new("Pair new Deck...", true, None);
+    let autostart = CheckMenuItem::new("Start at login", true, autostart_enabled, None);
     let quit = MenuItem::new("Quit", true, None);
-    let _ = menu.append_items(&[&connect, &disconnect, &pair, &quit]);
+    let _ = menu.append_items(&[&connect, &disconnect, &pair, &autostart, &quit]);
 
     // id() returns &MenuId; clone to take ownership for the comparison loop.
     let connect_id = connect.id().clone();
     let disconnect_id = disconnect.id().clone();
     let pair_id = pair.id().clone();
+    let autostart_id = autostart.id().clone();
     let quit_id = quit.id().clone();
 
     let icon = match make_icon() {
@@ -105,6 +116,8 @@ fn run_tray_thread(tx: &Sender<TrayEvent>, tooltip_rx: &Receiver<String>) {
         &connect_id,
         &disconnect_id,
         &pair_id,
+        &autostart,
+        &autostart_id,
         &quit_id,
     );
 }
@@ -118,6 +131,8 @@ fn pump_messages(
     connect_id: &tray_icon::menu::MenuId,
     disconnect_id: &tray_icon::menu::MenuId,
     pair_id: &tray_icon::menu::MenuId,
+    autostart: &CheckMenuItem,
+    autostart_id: &tray_icon::menu::MenuId,
     quit_id: &tray_icon::menu::MenuId,
 ) {
     use windows_sys::Win32::UI::WindowsAndMessaging::{
@@ -147,6 +162,10 @@ fn pump_messages(
                 Some(TrayEvent::Disconnect)
             } else if event.id == *pair_id {
                 Some(TrayEvent::Pair)
+            } else if event.id == *autostart_id {
+                // muda toggles the check state on click before firing the
+                // event, so is_checked() reflects the user's new desire.
+                Some(TrayEvent::ToggleAutostart(autostart.is_checked()))
             } else if event.id == *quit_id {
                 Some(TrayEvent::Quit)
             } else {

@@ -138,16 +138,9 @@ fn main() {
         return;
     }
 
-    #[cfg(windows)]
-    {
-        if autostart::current().is_none() {
-            if let Err(e) = autostart::enable() {
-                eprintln!("autostart register failed (code {e})");
-            } else {
-                eprintln!("autostart: registered for HKCU\\...\\Run");
-            }
-        }
-    }
+    // Autostart is opt-in: the user enables it from the tray's
+    // "Start at login" toggle. We never write the Run-key value on
+    // our own — first launch leaves it unset.
 
     run_normal(&identity, &args.state_dir);
 }
@@ -282,7 +275,7 @@ fn run_attach_loop(
 
     let mut driver = CliDriver { cli, port_cache: None };
 
-    let (tray_rx, tray_handle) = tray::spawn();
+    let (tray_rx, tray_handle) = tray::spawn(autostart::current().is_some());
     let mut sm = Attach::default();
     let mut paused = false;
     let mut last_tooltip = String::new();
@@ -344,6 +337,23 @@ fn run_attach_loop(
                                 }
                             }
                         }
+                    }
+                }
+                TrayEvent::ToggleAutostart(want_on) => {
+                    let result = if want_on {
+                        autostart::enable()
+                    } else {
+                        autostart::disable()
+                    };
+                    match result {
+                        Ok(()) => eprintln!(
+                            "tray: autostart {}",
+                            if want_on { "enabled" } else { "disabled" }
+                        ),
+                        Err(code) => eprintln!(
+                            "tray: autostart {} failed (code {code})",
+                            if want_on { "enable" } else { "disable" }
+                        ),
                     }
                 }
                 TrayEvent::Quit => {
