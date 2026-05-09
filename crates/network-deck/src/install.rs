@@ -288,14 +288,24 @@ fn write_sudoers(_user: &str, install_bin: &std::path::Path) -> std::io::Result<
          ALL ALL=(root) NOPASSWD: {bin} daemon, {bin} pair\n",
         bin = install_bin.display(),
     );
-    eprintln!(">> Writing {SUDOERS_PATH}");
-    std::fs::write(SUDOERS_PATH, body)?;
-    chmod(std::path::Path::new(SUDOERS_PATH), 0o440)?;
-    if !run_ok("visudo", &["-c", "-f", SUDOERS_PATH]) {
-        eprintln!("visudo validation failed for {SUDOERS_PATH}");
-        // A malformed file under /etc/sudoers.d/ makes sudo refuse to load
-        // any rules in the directory — users get "not in sudoers" with no
-        // recovery path. Remove the partial file so the host stays usable.
+    // Wrap write + chmod + visudo so any failure removes the partial file
+    // before propagating. A broken file under /etc/sudoers.d/ makes sudo
+    // refuse to load any rules in the directory — users get "not in
+    // sudoers" with no recovery path. Wrong mode or invalid content both
+    // hit this; cleanup must cover both.
+    let result = (|| -> std::io::Result<()> {
+        eprintln!(">> Writing {SUDOERS_PATH}");
+        std::fs::write(SUDOERS_PATH, body)?;
+        chmod(std::path::Path::new(SUDOERS_PATH), 0o440)?;
+        if !run_ok("visudo", &["-c", "-f", SUDOERS_PATH]) {
+            return Err(std::io::Error::other(format!(
+                "visudo validation failed for {SUDOERS_PATH}"
+            )));
+        }
+        Ok(())
+    })();
+    if let Err(e) = result {
+        eprintln!("{e}");
         let _ = std::fs::remove_file(SUDOERS_PATH);
         eprintln!("removed {SUDOERS_PATH} to keep sudo functional");
         std::process::exit(1);
@@ -323,23 +333,46 @@ fn write_desktop(
     );
     eprintln!(">> Writing {}", desktop_path.display());
     std::fs::write(desktop_path, body)?;
-    chown(app_dir, user, user)?;
-    chown(desktop_path, user, user)?;
+    chown_warn(app_dir, user, user);
+    chown_warn(desktop_path, user, user);
     Ok(())
 }
 
+/// Hard-failing chown: returns Err on subprocess failure. Used for
+/// security-bearing paths (anything whose ownership the sudoers grant
+/// relies on); a silent failure there means the install looks succeeded
+/// while leaving a hijackable binary or directory.
 fn chown(path: &std::path::Path, user: &str, group: &str) -> std::io::Result<()> {
+    if !run_ok("chown", &[&format!("{user}:{group}"), &path.display().to_string()]) {
+        return Err(std::io::Error::other(format!(
+            "chown {user}:{group} {} failed",
+            path.display()
+        )));
+    }
+    Ok(())
+}
+
+/// Hard-failing chmod: returns Err on subprocess failure. Critical for
+/// the sudoers file (must be 0o440 for sudo to load it — wrong mode and
+/// sudo silently refuses) and the install dir/binary (root-owned 0o755
+/// keeps the deck user from swapping the binary out under NOPASSWD).
+fn chmod(path: &std::path::Path, mode: u32) -> std::io::Result<()> {
+    if !run_ok("chmod", &[&format!("{mode:o}"), &path.display().to_string()]) {
+        return Err(std::io::Error::other(format!(
+            "chmod {mode:o} {} failed",
+            path.display()
+        )));
+    }
+    Ok(())
+}
+
+/// Warn-only chown for non-security-bearing paths (user-owned desktop
+/// entries etc.). A failure here doesn't compromise install integrity,
+/// so we don't unwind a successful sudoers + binary install over it.
+fn chown_warn(path: &std::path::Path, user: &str, group: &str) {
     if !run_ok("chown", &[&format!("{user}:{group}"), &path.display().to_string()]) {
         eprintln!("warning: chown {user}:{group} {} failed", path.display());
     }
-    Ok(())
-}
-
-fn chmod(path: &std::path::Path, mode: u32) -> std::io::Result<()> {
-    if !run_ok("chmod", &[&format!("{mode:o}"), &path.display().to_string()]) {
-        eprintln!("warning: chmod {mode:o} {} failed", path.display());
-    }
-    Ok(())
 }
 
 /// Resolve a privileged tool name to an absolute path on `KNOWN_BIN_DIRS`.
