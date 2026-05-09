@@ -170,10 +170,12 @@ pub fn run(args: Args) {
                         );
                         wrote_first_status = true;
                     }
+                    last_status = Some(status);
                 }
+                // Leave last_status untouched so we retry next tick — otherwise
+                // a transient ENOSPC / EROFS pins the kiosk on a stale view.
                 Err(e) => eprintln!("control: write_status failed: {e}"),
             }
-            last_status = Some(status);
         }
         std::thread::sleep(TICK_INTERVAL);
     }
@@ -252,4 +254,3 @@ pub fn run_pair(state_dir: &std::path::Path) {
         }
     }
 }
-
