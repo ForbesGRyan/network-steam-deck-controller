@@ -34,6 +34,8 @@ mod inhibit;
 mod install;
 #[cfg(target_os = "linux")]
 mod pair_worker;
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+mod steam_shortcut;
 
 #[cfg(not(target_os = "linux"))]
 fn main() {

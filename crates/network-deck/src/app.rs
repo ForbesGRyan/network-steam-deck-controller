@@ -42,6 +42,17 @@ enum SetupPhase {
 struct SetupState {
     self_exe: PathBuf,
     phase: SetupPhase,
+    /// Pre-install opt-out: whether to also drop a non-Steam shortcut
+    /// into Steam's userdata trees so the kiosk shows up in Game Mode
+    /// without the manual "Add a Non-Steam Game" step. Default true;
+    /// the checkbox sits next to the Install button.
+    add_to_steam: bool,
+    /// Populated once when we transition into `Done`. `Some(Ok(msg))`
+    /// is a human-readable summary ("Added to Steam for 2 accounts —
+    /// restart Steam"); `Some(Err(msg))` is a soft failure we surface
+    /// inline (Steam never run, all writes failed, etc.). `None` while
+    /// `add_to_steam` was unchecked or we haven't run yet.
+    steam_outcome: Option<Result<String, String>>,
 }
 
 /// Pre-pair flow: we have an installed binary but no trust file yet.
@@ -114,6 +125,8 @@ impl KioskApp {
         self.setup = Some(SetupState {
             self_exe: self_exe.clone(),
             phase: SetupPhase::Idle,
+            add_to_steam: true,
+            steam_outcome: None,
         });
         self.self_exe = Some(self_exe);
         self
@@ -723,10 +736,17 @@ impl KioskApp {
     fn draw_setup(&mut self, ctx: &egui::Context) {
         // Poll the installer child if one is running. Take ownership so we
         // can mutate the state machine; restore unless the child is done.
+        // On the success edge (and only there) run the optional Steam
+        // shortcut step exactly once and record its outcome.
         if let Some(state) = self.setup.as_mut() {
             if let SetupPhase::Installing(child) = &mut state.phase {
                 match child.try_wait() {
-                    Ok(Some(status)) if status.success() => state.phase = SetupPhase::Done,
+                    Ok(Some(status)) if status.success() => {
+                        if state.add_to_steam {
+                            state.steam_outcome = Some(run_steam_shortcut_step());
+                        }
+                        state.phase = SetupPhase::Done;
+                    }
                     Ok(Some(status)) => {
                         state.phase = SetupPhase::Failed(format!(
                             "installer exited with {status}. Open a terminal and run\nsudo {} install\nto see the full error.",
@@ -755,7 +775,24 @@ impl KioskApp {
                             )
                             .size(20.0),
                         );
-                        ui.add_space(40.0);
+                        ui.add_space(24.0);
+
+                        // Opt-out checkbox. Default checked: the whole
+                        // point of the kiosk is to launch from Game Mode,
+                        // and that requires a Steam library entry.
+                        ui.horizontal(|ui| {
+                            ui.add_space(ui.available_width() / 2.0 - 220.0);
+                            ui.checkbox(
+                                &mut state.add_to_steam,
+                                egui::RichText::new(
+                                    "Add to Steam library (skip the manual \
+                                     \"Add a Non-Steam Game\" step)",
+                                )
+                                .size(16.0),
+                            );
+                        });
+
+                        ui.add_space(16.0);
                         let btn = egui::Button::new(
                             egui::RichText::new("Install").size(32.0),
                         )
@@ -784,13 +821,26 @@ impl KioskApp {
                         ui.spinner();
                     }
                     SetupPhase::Done => {
-                        ui.label(
-                            egui::RichText::new(
-                                "Setup complete. Close this window and relaunch from\n\
-                                 Steam (Game Mode) or your application launcher.",
-                            )
-                            .size(20.0),
-                        );
+                        let body = match &state.steam_outcome {
+                            Some(Ok(msg)) => format!(
+                                "Setup complete.\n\n\
+                                 {msg}\n\n\
+                                 Close this window, then restart Steam to see \
+                                 \"Network Deck\" in your library.",
+                            ),
+                            Some(Err(msg)) => format!(
+                                "Setup complete — but the Steam shortcut step \
+                                 didn't go through:\n\n  {msg}\n\n\
+                                 Add it manually: in Steam, \"Add a Non-Steam \
+                                 Game\" → /var/lib/network-deck/network-deck.",
+                            ),
+                            None => {
+                                "Setup complete. Close this window and relaunch \
+                                 from Steam (Game Mode) or your application \
+                                 launcher.".to_owned()
+                            }
+                        };
+                        ui.label(egui::RichText::new(body).size(20.0));
                     }
                     SetupPhase::Failed(msg) => {
                         ui.colored_label(egui::Color32::LIGHT_RED, egui::RichText::new(msg).size(18.0));
@@ -807,6 +857,58 @@ impl KioskApp {
             });
         });
     }
+}
+
+/// Drop a non-Steam game shortcut into every Steam userdata account so
+/// the kiosk shows up in the user's Steam library without the manual
+/// "Add a Non-Steam Game" walk. Runs in the kiosk process (deck user) —
+/// the install subcommand stays root-only and unaware of this side trip.
+///
+/// The returned `Ok(msg)` is rendered verbatim on the setup-complete
+/// screen; `Err(msg)` surfaces a soft failure with a manual fallback.
+/// Either branch leaves the install otherwise complete — the bridge
+/// itself works regardless of Steam state.
+#[cfg(target_os = "linux")]
+fn run_steam_shortcut_step() -> Result<String, String> {
+    let home = std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .ok_or_else(|| "$HOME is not set".to_owned())?;
+
+    let spec = crate::steam_shortcut::ShortcutSpec {
+        exe: PathBuf::from(crate::install::INSTALL_BIN),
+        app_name: "Network Deck".to_owned(),
+        start_dir: PathBuf::from(crate::install::INSTALL_DIR),
+        tags: Vec::new(),
+    };
+
+    let results = crate::steam_shortcut::add_to_all_userdata(&home, &spec);
+    if results.is_empty() {
+        return Err(
+            "Steam has never been launched on this Deck — userdata directory \
+             doesn't exist yet. Open Steam once, then re-run setup."
+                .to_owned(),
+        );
+    }
+
+    let mut ok = 0usize;
+    let mut errors: Vec<String> = Vec::new();
+    for (dir, res) in &results {
+        match res {
+            Ok(_) => ok += 1,
+            Err(e) => errors.push(format!("{}: {e}", dir.display())),
+        }
+    }
+
+    if ok == 0 {
+        return Err(format!("all {} write(s) failed:\n{}", errors.len(), errors.join("\n")));
+    }
+    let suffix = if errors.is_empty() {
+        String::new()
+    } else {
+        format!(" ({} failed: {})", errors.len(), errors.join("; "))
+    };
+    let plural = if ok == 1 { "account" } else { "accounts" };
+    Ok(format!("Added to Steam for {ok} {plural}{suffix}."))
 }
 
 #[cfg(target_os = "linux")]
