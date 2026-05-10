@@ -171,7 +171,7 @@ pub fn run(args: Args) {
         let effective_peer_present = beacon_present && !paused;
         if let Some(action) = conn.tick(effective_peer_present, &mut runner) {
             eprintln!("connection: {action:?} (state={:?})", conn.state());
-            apply_firewall(action.clone(), &beacon, &mut peer_lock);
+            apply_firewall(action, &beacon, &mut peer_lock);
             apply_inhibit(action, &mut idle_inhibit);
         }
         // Refresh the firewall rule if the peer's DHCP lease renewed under

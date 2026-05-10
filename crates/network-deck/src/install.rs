@@ -66,16 +66,19 @@ pub(super) fn install_files(ctx: &InstallContext) -> std::io::Result<()> {
     if let Some(parent) = ctx.sudoers_path.parent() {
         std::fs::create_dir_all(parent)?;
     }
+    eprintln!(">> Writing {}", ctx.sudoers_path.display());
     std::fs::write(&ctx.sudoers_path, sudoers_body(&ctx.install_bin))?;
 
     if let Some(parent) = ctx.modules_load_path.parent() {
         std::fs::create_dir_all(parent)?;
     }
+    eprintln!(">> Writing {}", ctx.modules_load_path.display());
     std::fs::write(&ctx.modules_load_path, MODULES_LOAD_BODY)?;
 
     std::fs::create_dir_all(&ctx.install_dir)?;
 
     std::fs::create_dir_all(&ctx.app_dir)?;
+    eprintln!(">> Writing {}", ctx.desktop_path.display());
     std::fs::write(&ctx.desktop_path, desktop_body(&ctx.install_bin))?;
 
     for legacy in &ctx.legacy_sudoers_paths {
@@ -83,7 +86,7 @@ pub(super) fn install_files(ctx: &InstallContext) -> std::io::Result<()> {
             continue;
         }
         match std::fs::remove_file(legacy) {
-            Ok(()) => {}
+            Ok(()) => eprintln!(">> Removed legacy {}", legacy.display()),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
             Err(e) => return Err(e),
         }
@@ -98,6 +101,7 @@ pub(super) fn install_files(ctx: &InstallContext) -> std::io::Result<()> {
 /// usbip package; production `uninstall` wraps this with those.
 pub(super) fn uninstall_files(ctx: &InstallContext) -> std::io::Result<()> {
     let remove_file = |p: &Path| -> std::io::Result<()> {
+        eprintln!(">> Removing {}", p.display());
         match std::fs::remove_file(p) {
             Ok(()) => Ok(()),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
@@ -105,6 +109,7 @@ pub(super) fn uninstall_files(ctx: &InstallContext) -> std::io::Result<()> {
         }
     };
     let remove_dir_all = |p: &Path| -> std::io::Result<()> {
+        eprintln!(">> Removing {}", p.display());
         match std::fs::remove_dir_all(p) {
             Ok(()) => Ok(()),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
@@ -175,11 +180,10 @@ pub fn run() -> std::io::Result<()> {
     // hijack PATH and execute as root. The sudoers NOPASSWD entry below
     // is the sole privilege-escalation path.
     chmod(&ctx.install_bin, 0o755)?;
-    // Write all files (sudoers, modules-load, .desktop, remove legacy sudoers).
-    // chmod/chown and visudo validation happen after for the sudoers file.
-    eprintln!(">> Writing {}", ctx.sudoers_path.display());
-    eprintln!(">> Writing {}", ctx.modules_load_path.display());
-    eprintln!(">> Writing {}", ctx.desktop_path.display());
+    // Write all files (sudoers, modules-load, .desktop, remove legacy
+    // sudoers). install_files prints each ">> Writing X" line as it goes,
+    // so a midway failure leaves the log accurately reflecting what hit
+    // disk. chmod/chown and visudo validation happen after for sudoers.
     install_files(&ctx)?;
     // Secure the sudoers file and validate it after install_files writes it.
     write_sudoers_post_files(&ctx.sudoers_path)?;
@@ -233,11 +237,7 @@ pub fn uninstall() -> std::io::Result<()> {
     let home_path = home.unwrap_or_else(|| PathBuf::from("/nonexistent"));
     let ctx = InstallContext::production(&home_path);
 
-    eprintln!(">> Removing {}", ctx.sudoers_path.display());
-    eprintln!(">> Removing {}", ctx.modules_load_path.display());
-    eprintln!(">> Removing {}", ctx.install_dir.display());
-    eprintln!(">> Removing {}", ctx.desktop_path.display());
-
+    // uninstall_files prints each ">> Removing X" line as it acts.
     if let Err(e) = uninstall_files(&ctx) {
         eprintln!("warning: uninstall_files: {e}");
     }

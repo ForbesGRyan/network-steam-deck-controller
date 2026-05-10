@@ -13,7 +13,7 @@ pub enum State {
     Bound,
 }
 
-#[derive(Debug, PartialEq, Eq, Clone)]
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
 pub enum Action {
     Bind,
     Unbind,

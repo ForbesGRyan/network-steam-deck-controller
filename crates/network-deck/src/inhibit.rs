@@ -21,9 +21,18 @@
 use std::os::unix::process::CommandExt;
 #[cfg(target_os = "linux")]
 use std::process::{Child, Command, Stdio};
+#[cfg(target_os = "linux")]
+use std::time::{Duration, Instant};
 
 #[cfg(target_os = "linux")]
 use crate::install::absolute_path_for;
+
+/// How long to wait after SIGTERM before escalating to SIGKILL on Drop.
+/// `systemd-inhibit` + `sleep` should exit on TERM in milliseconds; this
+/// window is generous so genuinely-running shutdown isn't aborted, but
+/// finite so a wedged child can't block daemon teardown forever.
+#[cfg(target_os = "linux")]
+const DROP_TERM_GRACE: Duration = Duration::from_millis(500);
 
 #[cfg(target_os = "linux")]
 pub struct IdleInhibit {
@@ -93,14 +102,42 @@ impl IdleInhibit {
 #[cfg(target_os = "linux")]
 impl Drop for IdleInhibit {
     fn drop(&mut self) {
-        let pgid = self.child.id() as i32;
+        let Ok(pgid) = i32::try_from(self.child.id()) else {
+            // Linux PIDs fit in i32; this branch is unreachable on real
+            // kernels but keeps Drop infallible without an unwrap.
+            eprintln!("inhibit: pid out of i32 range, leaking inhibitor");
+            return;
+        };
         // SIGTERM the whole group; setsid in pre_exec made child.id() == pgid.
         // SAFETY: kill(2) with a negative pid is well-defined; no Rust state
         // is touched.
         unsafe {
             libc::kill(-pgid, libc::SIGTERM);
         }
-        let _ = self.child.wait();
+
+        // Poll try_wait until the grace window elapses. If TERM is honoured
+        // (the normal case) we exit within a few ms. If the child is wedged
+        // we escalate to SIGKILL so the daemon's shutdown path can't hang.
+        let deadline = Instant::now() + DROP_TERM_GRACE;
+        loop {
+            match self.child.try_wait() {
+                Ok(Some(_)) => break,
+                Ok(None) if Instant::now() >= deadline => {
+                    eprintln!("inhibit: SIGTERM ignored after {DROP_TERM_GRACE:?}, sending SIGKILL");
+                    // SAFETY: same as above — kill(2) on a negative pgid.
+                    unsafe {
+                        libc::kill(-pgid, libc::SIGKILL);
+                    }
+                    let _ = self.child.wait();
+                    break;
+                }
+                Ok(None) => std::thread::sleep(Duration::from_millis(20)),
+                Err(e) => {
+                    eprintln!("inhibit: try_wait failed: {e}");
+                    break;
+                }
+            }
+        }
         eprintln!("inhibit: released idle:sleep lock");
     }
 }

@@ -21,7 +21,7 @@ use std::time::Duration;
 
 use eframe::egui;
 
-use discovery::pair::{Decision, PairCandidate, PairConfig, PairOutcome, PairUI};
+use discovery::pair::{Decision, PairConfig, PairOutcome, PairUI};
 use discovery::TrustedPeer;
 
 const WINDOW_SIZE: [f32; 2] = [520.0, 320.0];
@@ -163,19 +163,6 @@ impl PairUI for ChannelUi {
         self.decisions.recv().unwrap_or(Decision::Reject)
     }
 
-    fn prompt_candidates(&mut self, candidates: &[PairCandidate]) -> Option<PairCandidate> {
-        // Default impl iterates and prompts per-candidate. We do the same
-        // explicitly so we can short-circuit on the first Accept rather
-        // than re-prompting after the user already approved one.
-        for c in candidates {
-            let fpr = discovery::packet::fingerprint_str(&discovery::packet::fingerprint(&c.pubkey));
-            if matches!(self.prompt_peer(&c.name, &fpr), Decision::Accept) {
-                return Some(c.clone());
-            }
-        }
-        None
-    }
-
     fn on_paired(&mut self, peer: &TrustedPeer) {
         let _ = self.tx.send(UiEvent::Paired { name: peer.name.clone() });
     }
@@ -282,15 +269,18 @@ impl PairApp {
             .size(15.0),
         );
         bottom_buttons(ui, |ui| {
-            // right_to_left: rightmost is added first.
-            if button(ui, "Cancel").clicked() {
-                self.cancel.store(true, Ordering::Release);
-                ctx.send_viewport_cmd(egui::ViewportCommand::Close);
-            }
-            ui.add_space(8.0);
+            // right_to_left: rightmost is added first. Primary action
+            // (Start pairing) goes on the right per Win32 convention; the
+            // anti-foot-gun left-side-Accept is reserved for the
+            // fingerprint confirm screen.
             if button(ui, "Start pairing").clicked() {
                 self.start.store(true, Ordering::Release);
                 self.state = State::Searching;
+            }
+            ui.add_space(8.0);
+            if button(ui, "Cancel").clicked() {
+                self.cancel.store(true, Ordering::Release);
+                ctx.send_viewport_cmd(egui::ViewportCommand::Close);
             }
         });
     }
