@@ -815,17 +815,17 @@ fn spawn_installer(self_exe: &std::path::Path) -> std::io::Result<Child> {
     // / GNOME / Steam Deck Desktop Mode). The child re-execs us with `install`,
     // which contains the real bootstrap logic.
     //
-    // Pin self_exe to a system-owned path before elevating: pkexec runs the
-    // target as root, so a user-writable path here is a one-step root.
+    // We deliberately allow user-writable source paths here. The README's
+    // documented fallback is `sudo /path/to/network-deck install`, which has
+    // the same trust model: the user is consenting to elevate the binary
+    // they just downloaded. Refusing user-writable sources only funnels them
+    // into a Konsole workaround without raising the security bar. The
+    // post-install state is still safe — the `install` subcommand copies
+    // argv[0] into a root-owned tree (chowned + chmod 0755), and the
+    // sudoers NOPASSWD grant only references that root-owned path. The
+    // stricter `is_safe_install_source` check still gates the daemon-launch
+    // pkexec path in `daemon_child.rs`, where there's no consent UI.
     let canonical = self_exe.canonicalize().unwrap_or_else(|_| self_exe.to_path_buf());
-    if !crate::install::is_safe_install_source(&canonical) {
-        return Err(std::io::Error::other(format!(
-            "refusing to pkexec a binary outside the system tree: {}\n\
-             re-run from {} or anywhere under /usr/.",
-            canonical.display(),
-            crate::install::INSTALL_BIN,
-        )));
-    }
     let pkexec = crate::install::absolute_path_for("pkexec")
         .ok_or_else(|| std::io::Error::other("pkexec not found in /usr/bin or /bin"))?;
     std::process::Command::new(pkexec)
