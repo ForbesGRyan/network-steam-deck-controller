@@ -218,6 +218,16 @@ pub fn run_pair_with<U: PairUI>(cfg: &PairConfig, ui: &mut U) -> PairOutcome {
                         ui.on_failed(&msg);
                         return PairOutcome::IoError(io::Error::other("save trust"));
                     }
+                    // Tail-burst: hold the sender alive long enough to
+                    // broadcast a few more ACCEPT packets after we've
+                    // matched. The peer's recv loop may have only just
+                    // entered phase 3 and still depends on our beacons —
+                    // and the late-acceptor (whoever flipped to ACCEPT
+                    // last) might match the FIRST ACCEPT packet we send,
+                    // tear down its sender, and never return one of its
+                    // own. Without this linger our peer hangs at "Completing
+                    // pair…" until the 120 s outer timeout.
+                    thread::sleep(Duration::from_millis(400));
                     ui.on_paired(&peer);
                     return PairOutcome::Paired(peer);
                 }
@@ -342,10 +352,19 @@ impl Drop for SenderHandle {
 
 fn sender_loop(ctx: &SendCtx, state: &Arc<SendState>) {
     let mut next = Instant::now();
+    let mut last_flags = u8::MAX; // sentinel — won't equal any real flag set
     while !state.stop.load(Ordering::Relaxed) {
         let now = Instant::now();
+        let flags = state.flags.load(Ordering::Relaxed);
+        // On any flag transition, fire immediately. Without this, a
+        // phase-1 send that scheduled `next = now + 1 s` leaves up to a
+        // 1 s gap after phase 3 begins. If the peer's recv loop matches
+        // and tears down within that gap, we never broadcast our ACCEPT.
+        if flags != last_flags {
+            next = now;
+            last_flags = flags;
+        }
         if now >= next {
-            let flags = state.flags.load(Ordering::Relaxed);
             let peer_fpr = if flags & FLAG_ACCEPT != 0 {
                 state.peer_fpr.lock().map_or([0; FPR_LEN], |g| *g)
             } else {
