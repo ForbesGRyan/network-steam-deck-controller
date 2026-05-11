@@ -72,6 +72,9 @@ struct PairState {
 #[cfg(target_os = "linux")]
 pub struct KioskApp {
     control_dir: PathBuf,
+    /// Where `trusted-peers.toml` lives. Used by the "Forget peer & re-pair"
+    /// button to delete trust before the kiosk SIGTERMs the daemon and closes.
+    state_dir: PathBuf,
     /// Present iff the binary detected we're not yet installed. Drives the
     /// first-run flow instead of the normal status panel.
     setup: Option<SetupState>,
@@ -90,6 +93,11 @@ pub struct KioskApp {
     /// the Deck). Holds the moment we sent SIGTERM so we can show elapsed
     /// time and escalate to SIGKILL after the grace window.
     shutdown_started: Option<Instant>,
+    /// First tap on "Forget peer & re-pair" arms the confirmation; the
+    /// second tap within `UNPAIR_CONFIRM_WINDOW` actually unpairs. Auto-
+    /// disarmed after the window so an accidental tap doesn't sit there
+    /// waiting indefinitely.
+    unpair_pending: Option<Instant>,
     /// Snapshot of the environment at startup — visible from any failure
     /// panel so the user can see (and copy) exactly what the kiosk
     /// resolved without re-launching from a terminal.
@@ -98,15 +106,17 @@ pub struct KioskApp {
 
 #[cfg(target_os = "linux")]
 impl KioskApp {
-    pub fn new(control_dir: PathBuf) -> Self {
+    pub fn new(control_dir: PathBuf, state_dir: PathBuf) -> Self {
         Self {
             control_dir,
+            state_dir,
             setup: None,
             pair: None,
             self_exe: None,
             daemon_child: None,
             daemon: None,
             shutdown_started: None,
+            unpair_pending: None,
             boot_log: Vec::new(),
         }
     }
@@ -233,7 +243,18 @@ impl eframe::App for KioskApp {
             return;
         }
 
-        if self.draw_status_panel(ctx) {
+        let outcome = self.draw_status_panel(ctx);
+        if outcome.forget {
+            // Delete trust BEFORE begin_shutdown. The daemon already has the
+            // peer loaded in memory and will SIGTERM cleanly regardless;
+            // deleting the file first guarantees the next launch lands in
+            // the pair phase even if the user kills the window mid-shutdown.
+            if let Err(e) = discovery::trust::remove(&self.state_dir) {
+                eprintln!("forget peer: {e:?}");
+            }
+            self.begin_shutdown();
+            ctx.request_repaint();
+        } else if outcome.exit {
             // Exit button clicked — flow into the same path as the window
             // X-button so the daemon is SIGTERMed and the controller
             // released before we actually close.
@@ -245,17 +266,45 @@ impl eframe::App for KioskApp {
     }
 }
 
+/// What `draw_status_panel` reported to the `update` loop this frame.
+/// Both fields can be false (idle frame). They're mutually compatible
+/// but in practice only one fires per frame.
+#[cfg(target_os = "linux")]
+#[derive(Default, Clone, Copy)]
+struct StatusOutcome {
+    exit: bool,
+    forget: bool,
+}
+
+/// How long the "Forget peer" button stays armed between taps before
+/// it auto-disarms. 5 s is long enough for the user to read the
+/// confirmation copy without being so long that a stray earlier tap
+/// is still pending the next time they reach for Exit.
+#[cfg(target_os = "linux")]
+const UNPAIR_CONFIRM_WINDOW: Duration = Duration::from_secs(5);
+
 #[cfg(target_os = "linux")]
 impl KioskApp {
     /// Default status panel — heading + big toggle button + Vol±/touch hint.
     /// When `status.json` is missing, also draws a diagnostics block so the
     /// user can see why (no daemon, daemon alive but quiet, control_dir
     /// mismatch, etc.) without having to launch from a terminal.
-    /// Returns `true` when the Exit button was clicked this frame; the
-    /// caller flips `shutting_down` so the next frame paints the "Stopping…"
-    /// panel and runs the daemon teardown.
-    fn draw_status_panel(&self, ctx: &egui::Context) -> bool {
+    /// Returns a [`StatusOutcome`] flagging whether Exit or "Forget peer"
+    /// was clicked this frame; the caller flips `shutting_down` so the
+    /// next frame paints the "Stopping…" panel and runs the daemon teardown.
+    fn draw_status_panel(&mut self, ctx: &egui::Context) -> StatusOutcome {
+        // Auto-disarm the unpair confirmation if it's gone stale. Keeps an
+        // accidental tap from waiting indefinitely for a confirm.
+        if let Some(t) = self.unpair_pending {
+            if t.elapsed() > UNPAIR_CONFIRM_WINDOW {
+                self.unpair_pending = None;
+            }
+        }
+        let unpair_armed = self.unpair_pending.is_some();
+
         let mut exit_clicked = false;
+        let mut forget_first_tap = false;
+        let mut forget_confirmed = false;
         let status_diag = control::read_status_diag(&self.control_dir);
         let status = status_diag.as_ref().ok().cloned();
         let view = derive_view(status.as_ref());
@@ -317,6 +366,41 @@ impl KioskApp {
                     exit_clicked = true;
                 }
 
+                // "Forget peer & re-pair" — recovery for the case where the
+                // two sides disagree about who's paired (e.g. the deck saved
+                // trust during pair but the PC's ACCEPT packets all dropped,
+                // leaving the PC unpaired). Two-tap so it can't be hit by
+                // accident. First tap arms, second tap (within
+                // UNPAIR_CONFIRM_WINDOW) actually deletes the trust file
+                // and begins shutdown.
+                ui.add_space(12.0);
+                let (forget_text, forget_size, forget_height) = if unpair_armed {
+                    (
+                        "Tap again to confirm — daemon will stop",
+                        20.0,
+                        64.0,
+                    )
+                } else {
+                    ("Forget peer & re-pair", 16.0, 44.0)
+                };
+                let mut forget_rt = egui::RichText::new(forget_text).size(forget_size);
+                if unpair_armed {
+                    forget_rt = forget_rt
+                        .strong()
+                        .color(egui::Color32::from_rgb(220, 130, 60));
+                } else {
+                    forget_rt = forget_rt.weak();
+                }
+                let forget_btn = egui::Button::new(forget_rt)
+                    .min_size(egui::vec2(ui.available_width(), forget_height));
+                if ui.add(forget_btn).clicked() {
+                    if unpair_armed {
+                        forget_confirmed = true;
+                    } else {
+                        forget_first_tap = true;
+                    }
+                }
+
                 if status_is_none {
                     ui.add_space(20.0);
                     ui.separator();
@@ -369,7 +453,20 @@ impl KioskApp {
                 }
             });
         });
-        exit_clicked
+
+        // Apply intents collected from the egui closure now that its
+        // borrow on `self` (via captured locals) has ended.
+        if forget_first_tap {
+            self.unpair_pending = Some(Instant::now());
+        }
+        if forget_confirmed {
+            self.unpair_pending = None;
+        }
+
+        StatusOutcome {
+            exit: exit_clicked,
+            forget: forget_confirmed,
+        }
     }
 
     /// Hard cap on how long we wait for the daemon to exit gracefully

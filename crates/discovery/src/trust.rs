@@ -79,6 +79,25 @@ pub fn load(state_dir: &Path) -> Result<Option<TrustedPeer>, TrustError> {
     }))
 }
 
+/// Delete `state_dir/trusted-peers.toml`. Returns `Ok(true)` if a file
+/// was removed, `Ok(false)` if no trust file existed.
+///
+/// Idempotent so callers (CLI `unpair`, "Forget peer" UI, tray menu) can
+/// be retried without surfacing a confusing "no such file" error.
+///
+/// # Errors
+///
+/// Returns `TrustError::Io` if the file exists but cannot be removed
+/// (permissions, fs error, etc.).
+pub fn remove(state_dir: &Path) -> Result<bool, TrustError> {
+    let path = state_dir.join(FILENAME);
+    match fs::remove_file(&path) {
+        Ok(()) => Ok(true),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(false),
+        Err(e) => Err(TrustError::Io(e)),
+    }
+}
+
 /// Persist `peer` to `state_dir/trusted-peers.toml`, creating `state_dir` if needed.
 ///
 /// # Errors
@@ -139,6 +158,22 @@ mod tests {
         let dir = tempdir().unwrap();
         fs::write(dir.path().join(FILENAME), "not = valid = toml").unwrap();
         assert!(matches!(load(dir.path()), Err(TrustError::Toml(_))));
+    }
+
+    #[test]
+    fn remove_deletes_existing_file() {
+        let dir = tempdir().unwrap();
+        save(dir.path(), &sample()).unwrap();
+        assert!(load(dir.path()).unwrap().is_some());
+        assert!(remove(dir.path()).unwrap());
+        assert!(load(dir.path()).unwrap().is_none());
+    }
+
+    #[test]
+    fn remove_is_idempotent_on_missing_file() {
+        let dir = tempdir().unwrap();
+        assert!(!remove(dir.path()).unwrap());
+        assert!(!remove(dir.path()).unwrap());
     }
 
     #[test]

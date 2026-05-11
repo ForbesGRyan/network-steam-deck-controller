@@ -3,6 +3,7 @@
 //!   network-deck                 GUI; spawns the daemon as a child via sudo
 //!   network-deck daemon          Headless daemon (root). GUI invokes this.
 //!   network-deck pair            One-shot pair flow (root).
+//!   network-deck unpair          Delete the trust file so the next launch re-pairs.
 //!   network-deck install         First-run bootstrap (root).
 //!
 //! On non-Linux the bin's `main` is a stub that never reaches the linux body
@@ -72,6 +73,22 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             daemon::run_pair(&default_state_dir());
             Ok(())
         }
+        Some("unpair") => {
+            let state_dir = default_state_dir();
+            match discovery::trust::remove(&state_dir) {
+                Ok(true) => {
+                    eprintln!("unpaired (removed {}/trusted-peers.toml)", state_dir.display());
+                }
+                Ok(false) => {
+                    eprintln!("already unpaired (no trusted-peers.toml at {})", state_dir.display());
+                }
+                Err(e) => {
+                    eprintln!("unpair: {e:?}");
+                    std::process::exit(1);
+                }
+            }
+            Ok(())
+        }
         Some("install") => {
             install::run()?;
             Ok(())
@@ -82,7 +99,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         Some(other) => {
             eprintln!("unknown subcommand: {other}");
-            eprintln!("usage: network-deck [daemon|pair|install|uninstall]");
+            eprintln!("usage: network-deck [daemon|pair|unpair|install|uninstall]");
             std::process::exit(2);
         }
         None => run_gui(),
@@ -110,7 +127,7 @@ fn run_gui() -> Result<(), Box<dyn std::error::Error>> {
     };
     let state_dir = default_state_dir();
 
-    let mut app = app::KioskApp::new(control_dir.clone());
+    let mut app = app::KioskApp::new(control_dir.clone(), state_dir.clone());
 
     // Snapshot the runtime environment up front. Mirrored to stderr by
     // `log_boot` and rendered inside the kiosk's diagnostics panel so the

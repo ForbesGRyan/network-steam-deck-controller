@@ -22,7 +22,7 @@ pub use beacon::Beacon;
 pub use identity::{load_or_generate as load_or_generate_identity, Identity};
 pub use packet::MAGIC as BEACON_MAGIC;
 pub use pair::{run_pair_with, PairCandidate};
-pub use trust::{load as load_trust, save as save_trust, TrustedPeer};
+pub use trust::{load as load_trust, remove as remove_trust, save as save_trust, TrustedPeer};
 
 /// LAN data-plane UDP port. Both ends bind here; beacon broadcasts target it.
 pub const BEACON_PORT: u16 = 49152;

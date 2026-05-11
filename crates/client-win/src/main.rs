@@ -87,6 +87,7 @@ const TICK_INTERVAL: Duration = Duration::from_millis(500);
 enum Mode {
     Run,
     Pair,
+    Unpair,
 }
 
 struct ParsedArgs {
@@ -101,6 +102,7 @@ fn parse_args() -> ParsedArgs {
     while let Some(a) = args.next() {
         match a.as_str() {
             "pair" => mode = Mode::Pair,
+            "unpair" => mode = Mode::Unpair,
             "--state-dir" => {
                 state_dir_override = args.next().map(PathBuf::from);
                 if state_dir_override.is_none() {
@@ -125,6 +127,26 @@ fn parse_args() -> ParsedArgs {
 
 fn main() {
     let args = parse_args();
+
+    // Unpair is identity-independent: it only removes the trust file. Do it
+    // before identity load so a corrupt key file doesn't block recovery.
+    if matches!(args.mode, Mode::Unpair) {
+        match discovery::trust::remove(&args.state_dir) {
+            Ok(true) => eprintln!(
+                "unpaired (removed {}/trusted-peers.toml)",
+                args.state_dir.display(),
+            ),
+            Ok(false) => eprintln!(
+                "already unpaired (no trusted-peers.toml at {})",
+                args.state_dir.display(),
+            ),
+            Err(e) => {
+                eprintln!("unpair: {e:?}");
+                std::process::exit(1);
+            }
+        }
+        return;
+    }
 
     let identity = Arc::new(
         discovery::identity::load_or_generate(&args.state_dir).unwrap_or_else(|e| {
@@ -339,6 +361,33 @@ fn run_attach_loop(
                             }
                         }
                     }
+                }
+                TrayEvent::Forget => {
+                    // Confirm before destroying the trust file — the user
+                    // will have to walk through the full pair flow again
+                    // to recover.
+                    let body = "Remove the paired Deck and re-pair from scratch?\n\n\
+                                You'll need to confirm the pairing on both sides again.\n\
+                                Use this if the Deck and PC disagree about whether \
+                                they're paired.";
+                    if !dialogs::confirm("Forget Deck", body, "Forget", "Cancel") {
+                        continue;
+                    }
+                    eprintln!("tray: forget — removing trust");
+                    if let Err(e) = discovery::trust::remove(state_dir) {
+                        eprintln!("forget: trust::remove failed: {e:?}");
+                        dialogs::error(
+                            "Forget Deck",
+                            &format!("Could not remove trust file: {e:?}"),
+                        );
+                        continue;
+                    }
+                    // Drop the tray icon BEFORE re-exec for the same reason
+                    // the Pair path does — NIM_DELETE has to land before the
+                    // new process paints its own icon. The re-exec'd binary
+                    // sees no trust file and drops straight into first_run_pair.
+                    drop(tray_handle);
+                    util::reexec_self();
                 }
                 TrayEvent::ToggleAutostart(want_on) => {
                     let result = if want_on {

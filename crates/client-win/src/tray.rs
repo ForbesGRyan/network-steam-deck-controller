@@ -22,6 +22,11 @@ pub enum TrayEvent {
     Connect,
     Disconnect,
     Pair,
+    /// User asked to drop the current trust and start over. The main loop
+    /// runs a confirm dialog (this event is not, by itself, a decision)
+    /// and on Yes deletes `trusted-peers.toml` and re-execs into the
+    /// first-run pair flow.
+    Forget,
     /// User toggled the "Start at login" check item; payload is the new desired state.
     ToggleAutostart(bool),
     Quit,
@@ -75,14 +80,16 @@ fn run_tray_thread(
     let connect = MenuItem::new("Connect", true, None);
     let disconnect = MenuItem::new("Disconnect", true, None);
     let pair = MenuItem::new("Pair new Deck...", true, None);
+    let forget = MenuItem::new("Forget Deck...", true, None);
     let autostart = CheckMenuItem::new("Start at login", true, autostart_enabled, None);
     let quit = MenuItem::new("Quit", true, None);
-    let _ = menu.append_items(&[&connect, &disconnect, &pair, &autostart, &quit]);
+    let _ = menu.append_items(&[&connect, &disconnect, &pair, &forget, &autostart, &quit]);
 
     // id() returns &MenuId; clone to take ownership for the comparison loop.
     let connect_id = connect.id().clone();
     let disconnect_id = disconnect.id().clone();
     let pair_id = pair.id().clone();
+    let forget_id = forget.id().clone();
     let autostart_id = autostart.id().clone();
     let quit_id = quit.id().clone();
 
@@ -116,6 +123,7 @@ fn run_tray_thread(
         &connect_id,
         &disconnect_id,
         &pair_id,
+        &forget_id,
         &autostart,
         &autostart_id,
         &quit_id,
@@ -131,6 +139,7 @@ fn pump_messages(
     connect_id: &tray_icon::menu::MenuId,
     disconnect_id: &tray_icon::menu::MenuId,
     pair_id: &tray_icon::menu::MenuId,
+    forget_id: &tray_icon::menu::MenuId,
     autostart: &CheckMenuItem,
     autostart_id: &tray_icon::menu::MenuId,
     quit_id: &tray_icon::menu::MenuId,
@@ -162,6 +171,8 @@ fn pump_messages(
                 Some(TrayEvent::Disconnect)
             } else if event.id == *pair_id {
                 Some(TrayEvent::Pair)
+            } else if event.id == *forget_id {
+                Some(TrayEvent::Forget)
             } else if event.id == *autostart_id {
                 // muda toggles the check state on click before firing the
                 // event, so is_checked() reflects the user's new desire.
